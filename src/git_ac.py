@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
@@ -350,10 +352,64 @@ def invoke_with_budget(backend: Backend, stage: str, payload: str, budget: int) 
     size = utf8_size(prompt)
     if size > budget:
         raise GitAcError(f"{stage} prompt 超過 {budget} UTF-8 bytes（實際 {size}）。")
-    result = backend.invoke(prompt, stage).strip()
+    started = time.perf_counter()
+    try:
+        result = backend.invoke(prompt, stage).strip()
+    except Exception as exc:
+        trace_model_call(
+            backend,
+            stage,
+            prompt_bytes=size,
+            elapsed_seconds=time.perf_counter() - started,
+            result=None,
+            error_type=type(exc).__name__,
+        )
+        raise
+    trace_model_call(
+        backend,
+        stage,
+        prompt_bytes=size,
+        elapsed_seconds=time.perf_counter() - started,
+        result=result,
+        error_type=None,
+    )
     if not result:
         raise GitAcError(f"{backend.name} 在 {stage} 階段回傳空輸出。")
     return result
+
+
+def trace_model_call(
+    backend: Backend,
+    stage: str,
+    *,
+    prompt_bytes: int,
+    elapsed_seconds: float,
+    result: str | None,
+    error_type: str | None,
+) -> None:
+    raw_path = os.environ.get("GIT_AC_TRACE_FILE")
+    if not raw_path:
+        return
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "case": os.environ.get("GIT_AC_TRACE_CASE", ""),
+        "backend": backend.name,
+        "model": getattr(backend, "model", None),
+        "stage": stage,
+        "prompt_bytes": prompt_bytes,
+        "output_bytes": utf8_size(result) if result is not None else 0,
+        "output_fact_markers": sorted(set(FACT_RE.findall(result or ""))),
+        "elapsed_seconds": round(elapsed_seconds, 6),
+        "success": error_type is None and bool(result),
+        "error_type": error_type,
+    }
+    flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+    try:
+        descriptor = os.open(Path(raw_path), flags, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        raise GitAcError("無法寫入 GIT_AC_TRACE_FILE；已中止以免產生不完整的驗收紀錄。") from exc
 
 
 def generate_message(
@@ -531,8 +587,10 @@ class CodexBackend:
                     check=False,
                 )
                 if result.returncode != 0:
+                    reason = classify_codex_failure(result.stderr, self.model)
                     raise GitAcError(
-                        f"codex 在 {stage} 階段失敗（model {self.model}，exit code {result.returncode}）。"
+                        f"codex 在 {stage} 階段失敗（model {self.model}，{reason}，"
+                        f"exit code {result.returncode}）。"
                     )
                 return output_path.read_text(encoding="utf-8")
         except subprocess.TimeoutExpired as exc:
@@ -543,6 +601,19 @@ class CodexBackend:
             raise
         except OSError as exc:
             raise GitAcError(f"codex 在 {stage} 階段無法執行（model {self.model}）。") from exc
+
+
+def classify_codex_failure(stderr: str, model: str) -> str:
+    lowered = stderr.lower()
+    if "requires a newer version of codex" in lowered:
+        return "指定模型需要更新版 Codex CLI"
+    if "unknown model" in lowered or "model_not_found" in lowered or "model is not supported" in lowered:
+        return "指定模型不可用"
+    if "not logged in" in lowered or "authentication" in lowered or "unauthorized" in lowered:
+        return "尚未登入或登入已失效"
+    if "rate limit" in lowered or "usage limit" in lowered or "insufficient_quota" in lowered:
+        return "用量或速率限制不足"
+    return f"指定模型呼叫失敗：{model}"
 
 
 def write_private_message(message: str) -> Path:
@@ -642,4 +713,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

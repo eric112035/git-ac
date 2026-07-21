@@ -45,7 +45,13 @@ if stage == "final" and os.environ.get("GIT_AC_FAKE_MUTATE_FILE"):
 facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
 if stage in {"map", "reduce"}:
     suffix = "、".join(facts) if facts else "無語意標記"
-    print(f"摘要：保留來源、狀態與必要事實 {suffix}")
+    summary = f"摘要：保留來源、狀態與必要事實 {suffix}"
+    if os.environ.get("GIT_AC_FAKE_FORCE_TWO_REDUCE") == "1":
+        if stage == "map":
+            summary += " ROUND_MAP " + ("甲" * 6_000)
+        elif "ROUND_MAP" in prompt:
+            summary += " ROUND_ONE " + ("乙" * 2_500)
+    print(summary)
 elif os.environ.get("GIT_AC_FAKE_OUTPUT") is not None:
     print(os.environ["GIT_AC_FAKE_OUTPUT"])
 elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
@@ -53,4 +59,3 @@ elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
     print(f"feat: 更新大型資料處理\n\n保留語意標記：{suffix}")
 else:
     print("feat(core): 新增 staged 變更處理")
-

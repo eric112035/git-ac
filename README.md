@@ -23,3 +23,11 @@ uv run python -m unittest discover -s tests -v
 ```sh
 GIT_AC_RUN_LOCAL_INTEGRATION=1 uv run python -m unittest tests.test_real_integration -v
 ```
+
+以相同的大型合成 staged diff 比較真實 Spark 與 Luna，並只保存 stage metrics：
+
+```sh
+uv run python tests/run_real_codex_compare.py --target-kb 180
+```
+
+可設定 `GIT_AC_TRACE_FILE` 寫入權限為 `0600` 的 JSONL 驗收紀錄。紀錄只包含 backend、model、stage、prompt/output byte 數、`FACT_` 驗收標記、耗時與成功狀態，不包含 prompt、diff 或完整模型輸出。

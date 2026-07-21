@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -11,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from git_ac import (  # noqa: E402
     DiffUnit,
     GitAcError,
+    classify_codex_failure,
     generate_message,
     parse_name_status_z,
     split_text_utf8,
@@ -70,6 +75,24 @@ class ByteChunkTests(unittest.TestCase):
         self.assertIn("FACT_ALPHA", result)
         self.assertIn("FACT_BETA", result)
 
+    def test_trace_records_metrics_without_prompt_or_full_output(self) -> None:
+        backend = RecordingBackend()
+        with tempfile.TemporaryDirectory() as raw_temp:
+            trace_path = Path(raw_temp) / "trace.jsonl"
+            with patch.dict(
+                os.environ,
+                {"GIT_AC_TRACE_FILE": str(trace_path), "GIT_AC_TRACE_CASE": "unit-trace"},
+            ):
+                generate_message([DiffUnit("small.txt", "FACT_ALPHA\n小型變更\n")], backend)
+            event = json.loads(trace_path.read_text(encoding="utf-8"))
+        self.assertEqual(event["case"], "unit-trace")
+        self.assertEqual(event["stage"], "final")
+        self.assertEqual(event["output_fact_markers"], ["FACT_ALPHA", "FACT_BETA"])
+        self.assertGreater(event["prompt_bytes"], 0)
+        self.assertGreater(event["output_bytes"], 0)
+        self.assertNotIn("prompt", event)
+        self.assertNotIn("output", event)
+
 
 class CommitMessageValidationTests(unittest.TestCase):
     def test_accepts_title_body_footer_and_breaking_change(self) -> None:
@@ -107,6 +130,23 @@ class CommitMessageValidationTests(unittest.TestCase):
                     validate_commit_message(message)
 
 
+class CodexFailureClassificationTests(unittest.TestCase):
+    def test_classifies_newer_cli_requirement_without_echoing_stderr(self) -> None:
+        stderr = "The 'gpt-5.6-luna' model requires a newer version of Codex. secret-details"
+        reason = classify_codex_failure(stderr, "gpt-5.6-luna")
+        self.assertEqual(reason, "指定模型需要更新版 Codex CLI")
+        self.assertNotIn("secret-details", reason)
+
+    def test_classifies_login_limit_and_unknown_model(self) -> None:
+        cases = (
+            ("not logged in", "尚未登入或登入已失效"),
+            ("rate limit exceeded", "用量或速率限制不足"),
+            ("unknown model", "指定模型不可用"),
+        )
+        for stderr, expected in cases:
+            with self.subTest(stderr=stderr):
+                self.assertEqual(classify_codex_failure(stderr, "model"), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
-

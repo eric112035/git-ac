@@ -49,10 +49,14 @@ else:
     if stage in {"map", "reduce"}:
         suffix = "、".join(facts) if facts else "無語意標記"
         output = f"摘要：保留來源、狀態與必要事實 {suffix}"
+        if os.environ.get("GIT_AC_FAKE_FORCE_TWO_REDUCE") == "1":
+            if stage == "map":
+                output += " ROUND_MAP " + ("甲" * 6_000)
+            elif "ROUND_MAP" in prompt:
+                output += " ROUND_ONE " + ("乙" * 2_500)
     elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
         suffix = "、".join(facts) if facts else "無"
         output = f"feat: 更新大型資料處理\n\n保留語意標記：{suffix}"
     else:
         output = "fix(codex): 修正雲端訊息產生流程"
 output_path.write_text(output, encoding="utf-8")
-
