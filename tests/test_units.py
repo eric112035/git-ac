@@ -16,6 +16,7 @@ from git_ac import (  # noqa: E402
     DiffUnit,
     GitAcError,
     classify_codex_failure,
+    configured_codex_model,
     generate_message,
     parse_name_status_z,
     split_text_utf8,
@@ -146,6 +147,18 @@ class CodexFailureClassificationTests(unittest.TestCase):
         for stderr, expected in cases:
             with self.subTest(stderr=stderr):
                 self.assertEqual(classify_codex_failure(stderr, "model"), expected)
+
+    def test_codex_model_defaults_to_spark_and_allows_environment_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_AC_CODEX_MODEL", None)
+            self.assertEqual(configured_codex_model(), "gpt-5.3-codex-spark")
+        with patch.dict(os.environ, {"GIT_AC_CODEX_MODEL": "gpt-5.6-luna"}):
+            self.assertEqual(configured_codex_model(), "gpt-5.6-luna")
+
+    def test_codex_model_rejects_empty_override(self) -> None:
+        with patch.dict(os.environ, {"GIT_AC_CODEX_MODEL": "  "}):
+            with self.assertRaises(GitAcError):
+                configured_codex_model()
 
 
 if __name__ == "__main__":

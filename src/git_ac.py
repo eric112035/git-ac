@@ -659,6 +659,13 @@ def retry_command(use_codex: bool, preview: bool) -> str:
     return "git ac" + (" " + " ".join(flags) if flags else "")
 
 
+def configured_codex_model() -> str:
+    model = os.environ.get("GIT_AC_CODEX_MODEL", DEFAULT_CODEX_MODEL).strip()
+    if not model:
+        raise GitAcError("GIT_AC_CODEX_MODEL 不得為空。")
+    return model
+
+
 def execute(args: argparse.Namespace) -> int:
     repo = find_repository()
     staged = has_staged_changes(repo)
@@ -678,9 +685,7 @@ def execute(args: argparse.Namespace) -> int:
     units = build_diff_units(repo, changes)
     timeout = model_timeout()
     if args.codex:
-        model = os.environ.get("GIT_AC_CODEX_MODEL", DEFAULT_CODEX_MODEL).strip()
-        if not model:
-            raise GitAcError("GIT_AC_CODEX_MODEL 不得為空。")
+        model = configured_codex_model()
         backend: Backend = CodexBackend(timeout, model)
     else:
         backend = LocalBackend(repo, timeout)

@@ -30,4 +30,10 @@ GIT_AC_RUN_LOCAL_INTEGRATION=1 uv run python -m unittest tests.test_real_integra
 uv run python tests/run_real_codex_compare.py --target-kb 180
 ```
 
+以約 150 KB 合成 staged diff 執行真實本機 `aitext`／oMLX 大型 chunk 驗收：
+
+```sh
+uv run python tests/run_real_local_large.py --target-kb 150
+```
+
 可設定 `GIT_AC_TRACE_FILE` 寫入權限為 `0600` 的 JSONL 驗收紀錄。紀錄只包含 backend、model、stage、prompt/output byte 數、`FACT_` 驗收標記、耗時與成功狀態，不包含 prompt、diff 或完整模型輸出。
