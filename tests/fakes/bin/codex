@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Offline fake for the codex exec output-file contract."""
+
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+stage_match = re.search(r"^TASK: (MAP|REDUCE|FINAL)$", prompt, re.MULTILINE)
+stage = stage_match.group(1).lower() if stage_match else "unknown"
+log_path = os.environ.get("GIT_AC_FAKE_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "backend": "codex",
+                    "stage": stage,
+                    "stdin_bytes": len(prompt.encode("utf-8")),
+                    "args": args,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+mode = os.environ.get("GIT_AC_FAKE_MODE", "success")
+if mode == "timeout":
+    time.sleep(30)
+if mode == "fail":
+    raise SystemExit(23)
+
+try:
+    output_path = Path(args[args.index("--output-last-message") + 1])
+except (ValueError, IndexError):
+    raise SystemExit(24)
+
+if mode == "empty":
+    output = ""
+elif os.environ.get("GIT_AC_FAKE_OUTPUT") is not None:
+    output = os.environ["GIT_AC_FAKE_OUTPUT"]
+else:
+    facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
+    if stage in {"map", "reduce"}:
+        suffix = "、".join(facts) if facts else "無語意標記"
+        output = f"摘要：保留來源、狀態與必要事實 {suffix}"
+    elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
+        suffix = "、".join(facts) if facts else "無"
+        output = f"feat: 更新大型資料處理\n\n保留語意標記：{suffix}"
+    else:
+        output = "fix(codex): 修正雲端訊息產生流程"
+output_path.write_text(output, encoding="utf-8")
+

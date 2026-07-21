@@ -1,0 +1,9 @@
+[project]
+name = "git-ac"
+version = "0.1.0"
+description = "Generate a Conventional Commits message for the staged Git snapshot"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Offline fake for the aitext stdin/stdout contract."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+
+prompt = sys.stdin.read()
+stage_match = re.search(r"^TASK: (MAP|REDUCE|FINAL)$", prompt, re.MULTILINE)
+stage = stage_match.group(1).lower() if stage_match else "unknown"
+log_path = os.environ.get("GIT_AC_FAKE_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {"backend": "aitext", "stage": stage, "stdin_bytes": len(prompt.encode("utf-8"))},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+mode = os.environ.get("GIT_AC_FAKE_MODE", "success")
+if mode == "timeout":
+    time.sleep(30)
+if mode == "fail":
+    raise SystemExit(17)
+if mode == "empty":
+    raise SystemExit(0)
+
+if stage == "final" and os.environ.get("GIT_AC_FAKE_MUTATE_FILE"):
+    mutate_path = Path(os.environ["GIT_AC_FAKE_MUTATE_FILE"])
+    mutate_path.write_text("模型執行期間變更\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", os.environ["GIT_AC_FAKE_REPO"], "add", "--", str(mutate_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
+if stage in {"map", "reduce"}:
+    suffix = "、".join(facts) if facts else "無語意標記"
+    print(f"摘要：保留來源、狀態與必要事實 {suffix}")
+elif os.environ.get("GIT_AC_FAKE_OUTPUT") is not None:
+    print(os.environ["GIT_AC_FAKE_OUTPUT"])
+elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
+    suffix = "、".join(facts) if facts else "無"
+    print(f"feat: 更新大型資料處理\n\n保留語意標記：{suffix}")
+else:
+    print("feat(core): 新增 staged 變更處理")
+
