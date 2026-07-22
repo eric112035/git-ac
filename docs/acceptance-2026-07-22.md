@@ -33,11 +33,14 @@
 ## 自動測試
 
 - 指令：`uv run python -m unittest discover -s tests -v`
-- 結果：22 個離線測試通過；1 個真實本機整合案例依預設跳過。
+- 結果：29 個離線測試通過；1 個真實本機整合案例依預設跳過。
 - 另以 `GIT_AC_RUN_LOCAL_INTEGRATION=1` 單獨執行真實本機小型 preview：1 個測試通過，耗時 17.789 秒。
 - Codex commit 後再次執行離線測試：結果相同，耗時 2.198 秒。
 - 150 KB 單檔案例：production 48,000-byte budget 下使用至少 4 個 map chunks，所有必要標記保留。
 - 超過 1 MB 多檔案例：production 48,000-byte budget 下強制並通過至少兩層 recursive reduce；每個 prompt 均未超過預算。
+- Staging 邊界案例：已有 staged 檔案時，額外的 working tree 與 untracked 內容都不會被自動加入。
+- Codex request budget 案例：最低預估呼叫數超過上限時，在第一個模型 request 前中止；staged snapshot 不變。
+- 檔案清單案例：納入完整 diff 與排除完整內容的檔案分組顯示，資訊只寫入 stderr。
 
 ## 真實 Spark／Luna 大型比較
 

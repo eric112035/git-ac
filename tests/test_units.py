@@ -13,9 +13,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from git_ac import (  # noqa: E402
+    CallBudgetBackend,
     DiffUnit,
     GitAcError,
     classify_codex_failure,
+    configured_codex_max_calls,
     configured_codex_model,
     generate_message,
     parse_name_status_z,
@@ -75,6 +77,22 @@ class ByteChunkTests(unittest.TestCase):
         self.assertTrue(all(utf8_size(prompt) <= 1_800 for _stage, prompt in backend.calls))
         self.assertIn("FACT_ALPHA", result)
         self.assertIn("FACT_BETA", result)
+
+    def test_codex_preflight_rejects_excessive_map_calls_before_invocation(self) -> None:
+        backend = RecordingBackend()
+        units = [DiffUnit("large.txt", "大型內容\n" * 2_000)]
+        with self.assertRaisesRegex(GitAcError, "尚未送出任何模型 request"):
+            generate_message(units, backend, budget=1_800, max_calls=2)
+        self.assertEqual(backend.calls, [])
+
+    def test_call_budget_backend_stops_before_exceeding_limit(self) -> None:
+        raw_backend = RecordingBackend()
+        backend = CallBudgetBackend(raw_backend, max_calls=1)
+        backend.invoke("prompt", "final")
+        with self.assertRaisesRegex(GitAcError, "已達上限 1 次"):
+            backend.invoke("prompt", "final")
+        self.assertEqual(backend.calls_used, 1)
+        self.assertEqual(len(raw_backend.calls), 1)
 
     def test_trace_records_metrics_without_prompt_or_full_output(self) -> None:
         backend = RecordingBackend()
@@ -159,6 +177,20 @@ class CodexFailureClassificationTests(unittest.TestCase):
         with patch.dict(os.environ, {"GIT_AC_CODEX_MODEL": "  "}):
             with self.assertRaises(GitAcError):
                 configured_codex_model()
+
+    def test_codex_call_limit_defaults_to_twelve_and_allows_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GIT_AC_CODEX_MAX_CALLS", None)
+            self.assertEqual(configured_codex_max_calls(), 12)
+        with patch.dict(os.environ, {"GIT_AC_CODEX_MAX_CALLS": "20"}):
+            self.assertEqual(configured_codex_max_calls(), 20)
+
+    def test_codex_call_limit_rejects_non_positive_and_invalid_values(self) -> None:
+        for value in ("0", "-1", "many"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"GIT_AC_CODEX_MAX_CALLS": value}):
+                    with self.assertRaises(GitAcError):
+                        configured_codex_max_calls()
 
 
 if __name__ == "__main__":

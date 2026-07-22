@@ -20,7 +20,9 @@ from typing import Callable, Protocol, Sequence
 
 PROMPT_BUDGET = 48_000
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex-spark"
+DEFAULT_CODEX_MAX_CALLS = 12
 DEFAULT_TIMEOUT_SECONDS = 120
+MAX_REPORTED_FILES = 100
 ALLOWED_TYPES = frozenset(
     {"build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test"}
 )
@@ -67,6 +69,7 @@ class FileChange:
 class DiffUnit:
     source: str
     text: str
+    exclusion_reason: str | None = None
 
 
 class Backend(Protocol):
@@ -74,6 +77,26 @@ class Backend(Protocol):
 
     def invoke(self, prompt: str, stage: str) -> str:
         """Run the model once and return its final text output."""
+
+
+class CallBudgetBackend:
+    """Count model calls and optionally stop before exceeding a hard limit."""
+
+    def __init__(self, backend: Backend, max_calls: int | None = None) -> None:
+        self.backend = backend
+        self.name = backend.name
+        self.model = getattr(backend, "model", None)
+        self.max_calls = max_calls
+        self.calls_used = 0
+
+    def invoke(self, prompt: str, stage: str) -> str:
+        if self.max_calls is not None and self.calls_used >= self.max_calls:
+            raise GitAcError(
+                f"{self.name} 模型呼叫已達上限 {self.max_calls} 次；"
+                "請縮小 staged 範圍、改用本機 git ac，或明確提高 GIT_AC_CODEX_MAX_CALLS。"
+            )
+        self.calls_used += 1
+        return self.backend.invoke(prompt, stage)
 
 
 def utf8_size(value: str) -> int:
@@ -223,11 +246,38 @@ def build_diff_units(repo: Path, changes: Sequence[FileChange]) -> list[DiffUnit
         else:
             diff = read_change_diff(repo, change)
             if b"GIT binary patch" in diff or (b"Binary files " in diff and b" differ" in diff):
-                text = f"{heading}\n內容：未展開（二進位檔案）"
+                exclusion = "二進位檔案"
+                text = f"{heading}\n內容：未展開（{exclusion}）"
             else:
                 text = f"{heading}\nDiff：\n{diff.decode('utf-8', errors='replace')}"
-        units.append(DiffUnit(source=change.display_path, text=text))
+        units.append(DiffUnit(source=change.display_path, text=text, exclusion_reason=exclusion))
     return units
+
+
+def report_change_selection(
+    changes: Sequence[FileChange],
+    units: Sequence[DiffUnit],
+    emit: Callable[[str], None],
+) -> None:
+    if len(changes) != len(units):
+        raise GitAcError("內部 staged 檔案與 diff 單元數量不一致。")
+    included = [(change, unit) for change, unit in zip(changes, units) if unit.exclusion_reason is None]
+    excluded = [(change, unit) for change, unit in zip(changes, units) if unit.exclusion_reason is not None]
+
+    def emit_group(title: str, rows: Sequence[tuple[FileChange, DiffUnit]]) -> None:
+        if not rows:
+            return
+        emit(f"{title}（{len(rows)}）：")
+        for change, unit in rows[:MAX_REPORTED_FILES]:
+            path = json.dumps(change.display_path, ensure_ascii=False)
+            reason = f"（{unit.exclusion_reason}）" if unit.exclusion_reason else ""
+            emit(f"  {change.status} {path}{reason}")
+        remaining = len(rows) - MAX_REPORTED_FILES
+        if remaining > 0:
+            emit(f"  …另有 {remaining} 個檔案未列出")
+
+    emit_group("納入 AI 完整 diff 分析的檔案", included)
+    emit_group("排除完整內容、只提供狀態與路徑的檔案", excluded)
 
 
 def prompt_for(stage: str, payload: str) -> str:
@@ -417,6 +467,7 @@ def generate_message(
     backend: Backend,
     *,
     budget: int = PROMPT_BUDGET,
+    max_calls: int | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> str:
     if not units:
@@ -424,6 +475,7 @@ def generate_message(
     report = progress or (lambda _message: None)
     full_payload = "\n\n".join(unit.text for unit in units)
     if utf8_size(prompt_for("final", full_payload)) <= budget:
+        report("預估模型呼叫：1 次 final。")
         return invoke_with_budget(backend, "final", full_payload, budget)
 
     map_capacity = payload_capacity("map", budget)
@@ -431,6 +483,17 @@ def generate_message(
     for unit in units:
         pieces.extend(split_unit(unit, map_capacity))
     map_groups = pack_items(pieces, map_capacity)
+    minimum_calls = len(map_groups) + 1
+    report(
+        f"大型 diff 將拆成 {len(map_groups)} 個 map chunks；"
+        f"預估至少呼叫模型 {minimum_calls} 次（含 final）。"
+    )
+    if max_calls is not None and minimum_calls > max_calls:
+        raise GitAcError(
+            f"Codex 預估至少需要 {minimum_calls} 次模型呼叫，超過上限 {max_calls} 次；"
+            "尚未送出任何模型 request。請縮小 staged 範圍、改用本機 git ac，"
+            "或明確設定 GIT_AC_CODEX_MAX_CALLS=<次數> 後重試。"
+        )
     summaries: list[str] = []
     for index, group in enumerate(map_groups, 1):
         report(f"正在摘要區塊 {index}/{len(map_groups)}…")
@@ -666,6 +729,17 @@ def configured_codex_model() -> str:
     return model
 
 
+def configured_codex_max_calls() -> int:
+    raw = os.environ.get("GIT_AC_CODEX_MAX_CALLS", str(DEFAULT_CODEX_MAX_CALLS))
+    try:
+        max_calls = int(raw)
+    except ValueError as exc:
+        raise GitAcError("GIT_AC_CODEX_MAX_CALLS 必須是正整數。") from exc
+    if max_calls <= 0:
+        raise GitAcError("GIT_AC_CODEX_MAX_CALLS 必須是正整數。")
+    return max_calls
+
+
 def execute(args: argparse.Namespace) -> int:
     repo = find_repository()
     staged = has_staged_changes(repo)
@@ -683,14 +757,25 @@ def execute(args: argparse.Namespace) -> int:
     before = staged_snapshot(repo)
     changes = list_staged_changes(repo)
     units = build_diff_units(repo, changes)
+    progress = lambda value: print(value, file=sys.stderr)
+    report_change_selection(changes, units, progress)
     timeout = model_timeout()
     if args.codex:
         model = configured_codex_model()
-        backend: Backend = CodexBackend(timeout, model)
+        max_calls = configured_codex_max_calls()
+        raw_backend: Backend = CodexBackend(timeout, model)
     else:
-        backend = LocalBackend(repo, timeout)
+        max_calls = None
+        raw_backend = LocalBackend(repo, timeout)
 
-    message = generate_message(units, backend, progress=lambda value: print(value, file=sys.stderr))
+    backend = CallBudgetBackend(raw_backend, max_calls)
+    message = generate_message(
+        units,
+        backend,
+        max_calls=max_calls,
+        progress=progress,
+    )
+    progress(f"模型呼叫次數：{backend.calls_used}")
     message = validate_commit_message(message)
     after = staged_snapshot(repo)
     if after != before:
