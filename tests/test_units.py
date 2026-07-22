@@ -19,6 +19,7 @@ from git_ac import (  # noqa: E402
     classify_codex_failure,
     configured_codex_max_calls,
     configured_codex_model,
+    diff_is_binary,
     generate_message,
     parse_name_status_z,
     split_text_utf8,
@@ -55,6 +56,21 @@ class ParseNameStatusTests(unittest.TestCase):
     def test_rejects_truncated_rename(self) -> None:
         with self.assertRaises(GitAcError):
             parse_name_status_z(b"R100\0old.txt\0")
+
+    def test_binary_detection_requires_an_exact_git_marker_line(self) -> None:
+        source_diff = (
+            b'diff --git a/source.py b/source.py\n'
+            b'+if b"Binary files " in diff and b" differ" in diff:\n'
+            b'+    return True\n'
+        )
+        self.assertFalse(diff_is_binary(source_diff))
+        self.assertTrue(
+            diff_is_binary(
+                b"diff --git a/image.png b/image.png\n"
+                b"Binary files a/image.png and b/image.png differ\n"
+            )
+        )
+        self.assertTrue(diff_is_binary(b"diff --git a/data.bin b/data.bin\nGIT binary patch\n"))
 
 
 class ByteChunkTests(unittest.TestCase):

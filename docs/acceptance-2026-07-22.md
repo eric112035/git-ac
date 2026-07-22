@@ -33,7 +33,7 @@
 ## 自動測試
 
 - 指令：`uv run python -m unittest discover -s tests -v`
-- 結果：29 個離線測試通過；1 個真實本機整合案例依預設跳過。
+- 結果：30 個離線測試通過；1 個真實本機整合案例依預設跳過。
 - 另以 `GIT_AC_RUN_LOCAL_INTEGRATION=1` 單獨執行真實本機小型 preview：1 個測試通過，耗時 17.789 秒。
 - Codex commit 後再次執行離線測試：結果相同，耗時 2.198 秒。
 - 150 KB 單檔案例：production 48,000-byte budget 下使用至少 4 個 map chunks，所有必要標記保留。

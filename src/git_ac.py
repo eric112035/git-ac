@@ -235,6 +235,16 @@ def read_change_diff(repo: Path, change: FileChange) -> bytes:
     return result.stdout
 
 
+def diff_is_binary(diff: bytes) -> bool:
+    return bool(
+        re.search(
+            rb"^(?:GIT binary patch|Binary files .+ differ)\r?$",
+            diff,
+            flags=re.MULTILINE,
+        )
+    )
+
+
 def build_diff_units(repo: Path, changes: Sequence[FileChange]) -> list[DiffUnit]:
     units: list[DiffUnit] = []
     for change in changes:
@@ -245,7 +255,7 @@ def build_diff_units(repo: Path, changes: Sequence[FileChange]) -> list[DiffUnit
             text = f"{heading}\n內容：未展開（{exclusion}）"
         else:
             diff = read_change_diff(repo, change)
-            if b"GIT binary patch" in diff or (b"Binary files " in diff and b" differ" in diff):
+            if diff_is_binary(diff):
                 exclusion = "二進位檔案"
                 text = f"{heading}\n內容：未展開（{exclusion}）"
             else:
