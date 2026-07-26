@@ -14,12 +14,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from git_ac import (  # noqa: E402
     CallBudgetBackend,
+    DEFAULT_GIT_AC_LOCAL_MODEL,
     DiffUnit,
     GitAcError,
     classify_codex_failure,
     configured_codex_max_calls,
     configured_codex_model,
+    configured_local_model,
     diff_is_binary,
+    diff_line_counts,
     generate_message,
     parse_name_status_z,
     split_text_utf8,
@@ -71,6 +74,22 @@ class ParseNameStatusTests(unittest.TestCase):
             )
         )
         self.assertTrue(diff_is_binary(b"diff --git a/data.bin b/data.bin\nGIT binary patch\n"))
+
+    def test_diff_line_counts_only_counts_content_inside_hunks(self) -> None:
+        diff = (
+            b"diff --git a/app.py b/app.py\n"
+            b"--- a/app.py\n"
+            b"+++ b/app.py\n"
+            b"@@ -1,2 +1,3 @@\n"
+            b" unchanged\n"
+            b"-old\n"
+            b"+new\n"
+            b"+++content beginning with pluses\n"
+            b"diff --git a/next.py b/next.py\n"
+            b"--- a/next.py\n"
+            b"+++ b/next.py\n"
+        )
+        self.assertEqual(diff_line_counts(diff), (2, 1))
 
 
 class ByteChunkTests(unittest.TestCase):
@@ -193,6 +212,24 @@ class CodexFailureClassificationTests(unittest.TestCase):
         with patch.dict(os.environ, {"GIT_AC_CODEX_MODEL": "  "}):
             with self.assertRaises(GitAcError):
                 configured_codex_model()
+
+    def test_local_model_defaults_to_git_ac_profile_and_allows_environment_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEFAULT_GIT_AC_LOCAL_MODEL", None)
+            self.assertEqual(
+                configured_local_model(),
+                DEFAULT_GIT_AC_LOCAL_MODEL,
+            )
+        with patch.dict(
+            os.environ,
+            {"DEFAULT_GIT_AC_LOCAL_MODEL": "omlx:custom-local-model"},
+        ):
+            self.assertEqual(configured_local_model(), "omlx:custom-local-model")
+
+    def test_local_model_rejects_empty_override(self) -> None:
+        with patch.dict(os.environ, {"DEFAULT_GIT_AC_LOCAL_MODEL": "  "}):
+            with self.assertRaises(GitAcError):
+                configured_local_model()
 
     def test_codex_call_limit_defaults_to_twelve_and_allows_override(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

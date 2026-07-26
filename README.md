@@ -1,10 +1,11 @@
 # git-ac
 
-`git ac` 的開發版本。它只分析目前的 staged snapshot，使用本機 `aitext`（預設）或官方 `codex exec`（`-c`）產生繁體中文 Conventional Commits 訊息，最後建立一個 commit。
+`git ac` 的開發版本。它只分析目前的 staged snapshot，使用本機 `aitext`（預設）或官方 `codex exec`（`-c`）產生繁體中文 Conventional Commits 訊息，最後建立一個 commit。本機模式預設指定 oMLX 的 `mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac` profile，將 commit message 工作與其他本機模型用途隔離。
 
 目前先從原始碼執行：
 
 ```sh
+uv run python src/git_ac.py -e
 uv run python src/git_ac.py -p
 uv run python src/git_ac.py
 uv run python src/git_ac.py -c -p
@@ -21,10 +22,69 @@ uv run python -m unittest discover -s tests -v
 ## Staging 邊界
 
 - index 已有 staged 變更時，只分析及提交既有 staged snapshot，不會再執行 `git add -A`。
-- index 為空但 working tree 有變更時，一般模式才會自動執行 `git add -A`。
-- `-p` 永遠不自動 staging。
+- index 為空但 working tree 有變更時，一般模式會實際執行 `git add -A`。
+- index 為空時，`-p` 與 `-e` 使用隔離的暫存 index／object database 模擬 `git add -A`；會分析 tracked、unstaged 與 untracked 變更，但真實 index 與專案 object database 不會改變。
 
 模型執行前會在 stderr 列出「納入 AI 完整 diff 分析」與「排除完整內容、只提供狀態與路徑」的檔案。特殊檔名會安全跳脫；每組最多列出 100 筆，其餘顯示省略數量。commit message 或 `-p` 的 stdout 不會被這些資訊污染。
+
+## 執行前估算
+
+直接估算所有尚未提交的變更：
+
+```sh
+git ac -e
+```
+
+若只想估算特定 commit 範圍，先手動 `git add <檔案>`；只要 index 已有 staged 內容，估算就不會納入其餘 unstaged／untracked 檔案。
+
+`-e` 是 `--estimate` 的短參數。它依正式執行使用的同一套排除與分塊邏輯，列出完整分析／排除檔案數、增刪行數、有效分析量、map chunks、最低模型呼叫數、Codex 上限及本機／Codex 建議。它不呼叫模型、不建立 commit、不改變真實 index，也不需要 `aitext` 或 `codex` 可用；不可與 `-c` 或 `-p` 同時使用。
+
+規模建議採 OR 判定：完整分析檔案不超過 5 個、異動不超過 300 行且不需分塊時為小型；超過其中任一條件為中型；超過 20 個檔案、1,000 行或至少 4 個 map chunks 時為大型。若 Codex 最低呼叫數已超過目前上限，則標示為超大型。敏感內容不論規模都應使用本機 `git ac`。
+
+完整操作說明見 [`docs/git-ac-usage-guide.md`](docs/git-ac-usage-guide.md)。
+
+## 本機模型與輸出上限
+
+本機模式固定透過以下命令呼叫 `aitext`，不會改變平常直接使用 `aitext` 時的預設模型：
+
+```sh
+aitext -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
+```
+
+單次需要改用其他本機模型時：
+
+```sh
+DEFAULT_GIT_AC_LOCAL_MODEL=omlx:custom-model git ac
+```
+
+空白的 `DEFAULT_GIT_AC_LOCAL_MODEL` 會直接報錯，不會退回 `aichat` 的全域預設模型。
+
+建議在 `aichat` 的 `omlx` client 登錄 git 專用 profile，並只對這個 model ID 注入 `max_tokens: 1024` 與 `temperature: 0`：
+
+```yaml
+clients:
+  - type: openai-compatible
+    name: omlx
+    api_base: http://localhost:8000/v1
+    models:
+      - name: mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
+        max_input_tokens: 131072
+        max_output_tokens: 1024
+    patch:
+      chat_completions:
+        '^mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac$':
+          body:
+            max_tokens: 1024
+            temperature: 0
+```
+
+在 `aichat 0.30.0` 中，`max_output_tokens` 是模型能力／context metadata，不會自行加入 OpenAI-compatible request；真正送到 oMLX 的是 `patch.chat_completions.<model>.body.max_tokens`。oMLX log 應顯示：
+
+```text
+max_tokens=1024, request_max_tokens=1024
+```
+
+48,000-byte prompt budget 限制輸入 diff；`max_tokens: 1024` 限制模型輸出，兩者互不取代。oMLX 的 `git-ac` profile 應設定 context window 131,072、Max Tokens 1,024、temperature 0，並實際關閉「啟用思考」；profile 名稱本身不會套用這些參數。
 
 ## Codex 呼叫上限
 

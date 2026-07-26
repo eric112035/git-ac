@@ -90,6 +90,13 @@ class ProductionBudgetTests(unittest.TestCase):
         trace = self.load_jsonl(self.trace_log)
         self.assertTrue(all(int(event["prompt_bytes"]) <= 48_000 for event in trace))
         self.assertTrue(all(bool(event["success"]) for event in trace))
+        self.assertTrue(
+            all(
+                event["model"]
+                == "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac"
+                for event in trace
+            )
+        )
 
     def test_single_file_over_150_kb_uses_multiple_map_chunks(self) -> None:
         facts = [f"FACT_SINGLE_{index:02d}" for index in range(9)]

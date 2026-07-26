@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -15,14 +16,32 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Iterator, Mapping, Protocol, Sequence
 
 
 PROMPT_BUDGET = 48_000
+DEFAULT_GIT_AC_LOCAL_MODEL = (
+    "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac"
+)
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_CODEX_MAX_CALLS = 12
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_REPORTED_FILES = 100
+CODEX_CONFIG_OVERRIDES = (
+    'approval_policy="never"',
+    'web_search="disabled"',
+)
+CODEX_DISABLED_FEATURES = (
+    "shell_tool",
+    "shell_snapshot",
+    "multi_agent",
+    "apps",
+    "plugins",
+    "hooks",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+)
 ALLOWED_TYPES = frozenset(
     {"build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style", "test"}
 )
@@ -70,6 +89,22 @@ class DiffUnit:
     source: str
     text: str
     exclusion_reason: str | None = None
+    additions: int = 0
+    deletions: int = 0
+
+
+@dataclass(frozen=True)
+class MessagePlan:
+    full_payload: str
+    map_groups: tuple[str, ...]
+
+    @property
+    def map_chunks(self) -> int:
+        return len(self.map_groups)
+
+    @property
+    def minimum_calls(self) -> int:
+        return self.map_chunks + 1
 
 
 class Backend(Protocol):
@@ -109,6 +144,7 @@ def run_git(
     *,
     input_text: str | None = None,
     check: bool = True,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -119,6 +155,7 @@ def run_git(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
     except FileNotFoundError as exc:
         raise GitAcError("找不到 git；請先安裝 Git 後重試。") from exc
@@ -142,8 +179,13 @@ def find_repository() -> Path:
     return Path(result.stdout.rstrip("\n"))
 
 
-def has_staged_changes(repo: Path) -> bool:
-    result = run_git(repo, ["diff", "--cached", "--quiet", "--no-ext-diff", "--"], check=False)
+def has_staged_changes(repo: Path, environment: Mapping[str, str] | None = None) -> bool:
+    result = run_git(
+        repo,
+        ["diff", "--cached", "--quiet", "--no-ext-diff", "--"],
+        check=False,
+        environment=environment,
+    )
     if result.returncode == 0:
         return False
     if result.returncode == 1:
@@ -156,8 +198,8 @@ def has_worktree_changes(repo: Path) -> bool:
     return bool(result.stdout)
 
 
-def staged_snapshot(repo: Path) -> str:
-    result = run_git(repo, ["write-tree"])
+def staged_snapshot(repo: Path, environment: Mapping[str, str] | None = None) -> str:
+    result = run_git(repo, ["write-tree"], environment=environment)
     snapshot = result.stdout.strip()
     if not snapshot:
         raise GitAcError("無法建立 staged snapshot。")
@@ -182,7 +224,10 @@ def parse_name_status_z(raw: bytes) -> list[FileChange]:
     return changes
 
 
-def list_staged_changes(repo: Path) -> list[FileChange]:
+def list_staged_changes(
+    repo: Path,
+    environment: Mapping[str, str] | None = None,
+) -> list[FileChange]:
     try:
         result = subprocess.run(
             ["git", "diff", "--cached", "--name-status", "-z", "--find-renames", "--no-ext-diff", "--"],
@@ -190,6 +235,7 @@ def list_staged_changes(repo: Path) -> list[FileChange]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=environment,
         )
     except FileNotFoundError as exc:
         raise GitAcError("找不到 git；請先安裝 Git 後重試。") from exc
@@ -212,7 +258,11 @@ def is_content_excluded(change: FileChange) -> str | None:
     return None
 
 
-def read_change_diff(repo: Path, change: FileChange) -> bytes:
+def read_change_diff(
+    repo: Path,
+    change: FileChange,
+    environment: Mapping[str, str] | None = None,
+) -> bytes:
     result = subprocess.run(
         [
             "git",
@@ -229,6 +279,7 @@ def read_change_diff(repo: Path, change: FileChange) -> bytes:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=environment,
     )
     if result.returncode != 0:
         raise GitAcError(f"讀取 staged diff 失敗：{change.display_path}")
@@ -245,7 +296,31 @@ def diff_is_binary(diff: bytes) -> bool:
     )
 
 
-def build_diff_units(repo: Path, changes: Sequence[FileChange]) -> list[DiffUnit]:
+def diff_line_counts(diff: bytes) -> tuple[int, int]:
+    additions = 0
+    deletions = 0
+    inside_hunk = False
+    for line in diff.splitlines():
+        if line.startswith(b"diff --git "):
+            inside_hunk = False
+            continue
+        if line.startswith(b"@@"):
+            inside_hunk = True
+            continue
+        if not inside_hunk:
+            continue
+        if line.startswith(b"+"):
+            additions += 1
+        elif line.startswith(b"-"):
+            deletions += 1
+    return additions, deletions
+
+
+def build_diff_units(
+    repo: Path,
+    changes: Sequence[FileChange],
+    environment: Mapping[str, str] | None = None,
+) -> list[DiffUnit]:
     units: list[DiffUnit] = []
     for change in changes:
         path_label = json.dumps(change.display_path, ensure_ascii=False)
@@ -253,15 +328,61 @@ def build_diff_units(repo: Path, changes: Sequence[FileChange]) -> list[DiffUnit
         exclusion = is_content_excluded(change)
         if exclusion:
             text = f"{heading}\n內容：未展開（{exclusion}）"
+            additions = 0
+            deletions = 0
         else:
-            diff = read_change_diff(repo, change)
+            diff = read_change_diff(repo, change, environment)
             if diff_is_binary(diff):
                 exclusion = "二進位檔案"
                 text = f"{heading}\n內容：未展開（{exclusion}）"
+                additions = 0
+                deletions = 0
             else:
                 text = f"{heading}\nDiff：\n{diff.decode('utf-8', errors='replace')}"
-        units.append(DiffUnit(source=change.display_path, text=text, exclusion_reason=exclusion))
+                additions, deletions = diff_line_counts(diff)
+        units.append(
+            DiffUnit(
+                source=change.display_path,
+                text=text,
+                exclusion_reason=exclusion,
+                additions=additions,
+                deletions=deletions,
+            )
+        )
     return units
+
+
+@contextmanager
+def simulated_staged_environment(repo: Path) -> Iterator[Mapping[str, str]]:
+    object_path = run_git(
+        repo,
+        ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+    ).stdout.strip()
+    if not object_path:
+        raise GitAcError("無法定位 Git object database，不能建立暫存 staging。")
+
+    with tempfile.TemporaryDirectory(prefix="git-ac-index-") as raw_temp:
+        temp_dir = Path(raw_temp)
+        temp_objects = temp_dir / "objects"
+        temp_objects.mkdir(mode=0o700)
+        environment = os.environ.copy()
+        environment["GIT_INDEX_FILE"] = str(temp_dir / "index")
+        environment["GIT_OBJECT_DIRECTORY"] = str(temp_objects)
+        alternates = [object_path]
+        existing_alternates = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        if existing_alternates:
+            alternates.append(existing_alternates)
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(alternates)
+
+        head = run_git(repo, ["rev-parse", "--verify", "HEAD"], check=False)
+        if head.returncode == 0:
+            run_git(repo, ["read-tree", "HEAD"], environment=environment)
+        else:
+            run_git(repo, ["read-tree", "--empty"], environment=environment)
+        run_git(repo, ["add", "-A"], environment=environment)
+        if not has_staged_changes(repo, environment):
+            raise GitAcError("暫存 staging 後仍沒有可分析的變更。")
+        yield environment
 
 
 def report_change_selection(
@@ -407,6 +528,23 @@ def pack_items(items: Sequence[str], max_bytes: int) -> list[str]:
     return groups
 
 
+def build_message_plan(units: Sequence[DiffUnit], budget: int = PROMPT_BUDGET) -> MessagePlan:
+    if not units:
+        raise GitAcError("沒有可分析的 staged 變更。")
+    full_payload = "\n\n".join(unit.text for unit in units)
+    if utf8_size(prompt_for("final", full_payload)) <= budget:
+        return MessagePlan(full_payload=full_payload, map_groups=())
+
+    map_capacity = payload_capacity("map", budget)
+    pieces: list[str] = []
+    for unit in units:
+        pieces.extend(split_unit(unit, map_capacity))
+    return MessagePlan(
+        full_payload=full_payload,
+        map_groups=tuple(pack_items(pieces, map_capacity)),
+    )
+
+
 def invoke_with_budget(backend: Backend, stage: str, payload: str, budget: int) -> str:
     prompt = prompt_for(stage, payload)
     size = utf8_size(prompt)
@@ -480,35 +618,27 @@ def generate_message(
     max_calls: int | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> str:
-    if not units:
-        raise GitAcError("沒有可分析的 staged 變更。")
     report = progress or (lambda _message: None)
-    full_payload = "\n\n".join(unit.text for unit in units)
-    if utf8_size(prompt_for("final", full_payload)) <= budget:
+    plan = build_message_plan(units, budget)
+    if not plan.map_groups:
         report("預估模型呼叫：1 次 final。")
-        return invoke_with_budget(backend, "final", full_payload, budget)
+        return invoke_with_budget(backend, "final", plan.full_payload, budget)
 
-    map_capacity = payload_capacity("map", budget)
-    pieces: list[str] = []
-    for unit in units:
-        pieces.extend(split_unit(unit, map_capacity))
-    map_groups = pack_items(pieces, map_capacity)
-    minimum_calls = len(map_groups) + 1
     report(
-        f"大型 diff 將拆成 {len(map_groups)} 個 map chunks；"
-        f"預估至少呼叫模型 {minimum_calls} 次（含 final）。"
+        f"大型 diff 將拆成 {plan.map_chunks} 個 map chunks；"
+        f"預估至少呼叫模型 {plan.minimum_calls} 次（含 final）。"
     )
-    if max_calls is not None and minimum_calls > max_calls:
+    if max_calls is not None and plan.minimum_calls > max_calls:
         raise GitAcError(
-            f"Codex 預估至少需要 {minimum_calls} 次模型呼叫，超過上限 {max_calls} 次；"
+            f"Codex 預估至少需要 {plan.minimum_calls} 次模型呼叫，超過上限 {max_calls} 次；"
             "尚未送出任何模型 request。請縮小 staged 範圍、改用本機 git ac，"
             "或明確設定 GIT_AC_CODEX_MAX_CALLS=<次數> 後重試。"
         )
     summaries: list[str] = []
-    for index, group in enumerate(map_groups, 1):
-        report(f"正在摘要區塊 {index}/{len(map_groups)}…")
+    for index, group in enumerate(plan.map_groups, 1):
+        report(f"正在摘要區塊 {index}/{plan.map_chunks}…")
         summary = invoke_with_budget(backend, "map", group, budget)
-        summaries.append(f"[MAP 摘要 {index}/{len(map_groups)}]\n{summary}")
+        summaries.append(f"[MAP 摘要 {index}/{plan.map_chunks}]\n{summary}")
 
     for round_number in range(1, 13):
         combined = "\n\n".join(summaries)
@@ -582,16 +712,17 @@ def model_timeout() -> int:
 class LocalBackend:
     name = "aitext"
 
-    def __init__(self, repo: Path, timeout: int) -> None:
+    def __init__(self, repo: Path, timeout: int, model: str) -> None:
         self.repo = repo
         self.timeout = timeout
+        self.model = model
         if shutil.which("aitext") is None:
             raise GitAcError("找不到 aitext；請確認本機 oMLX 工具已安裝並位於 PATH。")
 
     def invoke(self, prompt: str, stage: str) -> str:
         try:
             result = subprocess.run(
-                ["aitext"],
+                ["aitext", "-m", self.model],
                 cwd=self.repo,
                 input=prompt,
                 text=True,
@@ -637,18 +768,28 @@ class CodexBackend:
                 command = [
                     "codex",
                     "exec",
+                    "--strict-config",
+                    "--ignore-rules",
                     "--ephemeral",
                     "--ignore-user-config",
                     "--sandbox",
                     "read-only",
-                    "-C",
-                    str(temp_dir),
-                    "--model",
-                    self.model,
-                    "--output-last-message",
-                    str(output_path),
-                    "-",
                 ]
+                for override in CODEX_CONFIG_OVERRIDES:
+                    command.extend(["-c", override])
+                for feature in CODEX_DISABLED_FEATURES:
+                    command.extend(["--disable", feature])
+                command.extend(
+                    [
+                        "-C",
+                        str(temp_dir),
+                        "--model",
+                        self.model,
+                        "--output-last-message",
+                        str(output_path),
+                        "-",
+                    ]
+                )
                 result = subprocess.run(
                     command,
                     cwd=temp_dir,
@@ -716,19 +857,32 @@ def commit_message(repo: Path, message: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="git ac",
-        description="由 staged diff 產生 Conventional Commits 訊息並建立單一 commit。",
+        description="由 Git 變更產生 Conventional Commits 訊息並建立單一 commit。",
     )
     parser.add_argument("-c", action="store_true", dest="codex", help="使用官方 Codex CLI")
-    parser.add_argument("-p", action="store_true", dest="preview", help="只預覽訊息，不 commit 或自動 staging")
+    parser.add_argument(
+        "-p",
+        action="store_true",
+        dest="preview",
+        help="只預覽訊息，不 commit 或改變真實 index",
+    )
+    parser.add_argument(
+        "-e",
+        "--estimate",
+        action="store_true",
+        help="估算分析規模與模型呼叫，不呼叫模型、commit 或改變真實 index",
+    )
     return parser
 
 
-def retry_command(use_codex: bool, preview: bool) -> str:
+def retry_command(use_codex: bool, preview: bool, estimate: bool) -> str:
     flags = []
     if use_codex:
         flags.append("-c")
     if preview:
         flags.append("-p")
+    if estimate:
+        flags.append("-e")
     return "git ac" + (" " + " ".join(flags) if flags else "")
 
 
@@ -736,6 +890,16 @@ def configured_codex_model() -> str:
     model = os.environ.get("GIT_AC_CODEX_MODEL", DEFAULT_CODEX_MODEL).strip()
     if not model:
         raise GitAcError("GIT_AC_CODEX_MODEL 不得為空。")
+    return model
+
+
+def configured_local_model() -> str:
+    model = os.environ.get(
+        "DEFAULT_GIT_AC_LOCAL_MODEL",
+        DEFAULT_GIT_AC_LOCAL_MODEL,
+    ).strip()
+    if not model:
+        raise GitAcError("DEFAULT_GIT_AC_LOCAL_MODEL 不得為空。")
     return model
 
 
@@ -750,24 +914,91 @@ def configured_codex_max_calls() -> int:
     return max_calls
 
 
-def execute(args: argparse.Namespace) -> int:
-    repo = find_repository()
-    staged = has_staged_changes(repo)
-    if args.preview and not staged:
-        raise GitAcError("預覽模式沒有 staged 變更；請先執行 git add，再重試 git ac -p。")
-    if not staged:
-        if not has_worktree_changes(repo):
-            print("沒有可提交的變更。")
-            return 0
-        run_git(repo, ["add", "-A"])
-        staged = has_staged_changes(repo)
-    if not staged:
-        raise GitAcError("自動 staging 後仍沒有可分析的 staged 變更。")
+def format_kib(size: int) -> str:
+    return f"{size / 1024:.1f} KiB"
 
-    before = staged_snapshot(repo)
-    changes = list_staged_changes(repo)
-    units = build_diff_units(repo, changes)
+
+def estimate_recommendation(
+    *,
+    included_files: int,
+    changed_lines: int,
+    plan: MessagePlan,
+    codex_max_calls: int,
+) -> tuple[str, str]:
+    if plan.minimum_calls > codex_max_calls:
+        return (
+            "超大型",
+            "先拆分 staged 內容或使用本機 git ac；只有確認成本後才提高 Codex 呼叫上限。",
+        )
+    if included_files == 0:
+        return "小型", "完整內容均已排除，使用本機 git ac 即可。"
+    if plan.map_chunks >= 4 or included_files > 20 or changed_lines > 1_000:
+        return (
+            "大型",
+            "內容不敏感且重視速度時，建議使用 git ac -c；敏感內容仍使用本機 git ac。",
+        )
+    if plan.map_chunks > 0 or included_files > 5 or changed_lines > 300:
+        return (
+            "中型",
+            "本機 git ac 可處理；內容不敏感且重視速度時可改用 git ac -c。",
+        )
+    return "小型", "建議使用本機 git ac。"
+
+
+def report_estimate(units: Sequence[DiffUnit], codex_max_calls: int, emit: Callable[[str], None]) -> None:
+    included = [unit for unit in units if unit.exclusion_reason is None]
+    excluded = [unit for unit in units if unit.exclusion_reason is not None]
+    additions = sum(unit.additions for unit in included)
+    deletions = sum(unit.deletions for unit in included)
+    changed_lines = additions + deletions
+    plan = build_message_plan(units)
+    size = utf8_size(plan.full_payload)
+    scale, recommendation = estimate_recommendation(
+        included_files=len(included),
+        changed_lines=changed_lines,
+        plan=plan,
+        codex_max_calls=codex_max_calls,
+    )
+
+    emit("git ac 估算結果：")
+    emit(
+        f"  分析檔案：{len(units)}（完整分析 {len(included)}，排除完整內容 {len(excluded)}）"
+    )
+    emit(f"  完整分析文字異動：+{additions} / -{deletions} 行（合計 {changed_lines} 行）")
+    emit(f"  有效分析內容：{format_kib(size)}")
+    if plan.map_groups:
+        emit(f"  處理方式：{plan.map_chunks} 個 map chunks + 1 次 final")
+    else:
+        emit("  處理方式：直接 final")
+    emit(f"  預估模型呼叫：至少 {plan.minimum_calls} 次")
+    if plan.minimum_calls > codex_max_calls:
+        emit(f"  Codex 上限：超過目前 {codex_max_calls} 次上限")
+    else:
+        emit(f"  Codex 上限：在目前 {codex_max_calls} 次上限內")
+    emit(f"  規模判定：{scale}")
+    emit(f"  建議：{recommendation}")
+
+
+def execute_selected_snapshot(
+    args: argparse.Namespace,
+    repo: Path,
+    environment: Mapping[str, str] | None,
+    *,
+    simulated: bool,
+) -> int:
+    changes = list_staged_changes(repo, environment)
+    units = build_diff_units(repo, changes, environment)
+    if args.estimate:
+        if simulated:
+            print("目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。")
+        report_change_selection(changes, units, print)
+        report_estimate(units, configured_codex_max_calls(), print)
+        return 0
+
+    before = staged_snapshot(repo, environment)
     progress = lambda value: print(value, file=sys.stderr)
+    if simulated:
+        progress("目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。")
     report_change_selection(changes, units, progress)
     timeout = model_timeout()
     if args.codex:
@@ -775,8 +1006,10 @@ def execute(args: argparse.Namespace) -> int:
         max_calls = configured_codex_max_calls()
         raw_backend: Backend = CodexBackend(timeout, model)
     else:
+        model = configured_local_model()
         max_calls = None
-        raw_backend = LocalBackend(repo, timeout)
+        raw_backend = LocalBackend(repo, timeout, model)
+    progress(f"{raw_backend.name} 模型：{model}")
 
     backend = CallBudgetBackend(raw_backend, max_calls)
     message = generate_message(
@@ -787,7 +1020,7 @@ def execute(args: argparse.Namespace) -> int:
     )
     progress(f"模型呼叫次數：{backend.calls_used}")
     message = validate_commit_message(message)
-    after = staged_snapshot(repo)
+    after = staged_snapshot(repo, environment)
     if after != before:
         raise GitAcError("模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。")
 
@@ -800,6 +1033,26 @@ def execute(args: argparse.Namespace) -> int:
     return 0
 
 
+def execute(args: argparse.Namespace) -> int:
+    if args.estimate and (args.codex or args.preview):
+        raise GitAcError("-e／--estimate 不可與 -c 或 -p 同時使用。")
+    repo = find_repository()
+    staged = has_staged_changes(repo)
+    if staged:
+        return execute_selected_snapshot(args, repo, None, simulated=False)
+    if not has_worktree_changes(repo):
+        print("沒有可提交的變更。")
+        return 0
+    if args.preview or args.estimate:
+        with simulated_staged_environment(repo) as environment:
+            return execute_selected_snapshot(args, repo, environment, simulated=True)
+
+    run_git(repo, ["add", "-A"])
+    if not has_staged_changes(repo):
+        raise GitAcError("自動 staging 後仍沒有可分析的 staged 變更。")
+    return execute_selected_snapshot(args, repo, None, simulated=False)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -807,7 +1060,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return execute(args)
     except GitAcError as exc:
         print(f"git ac: {exc}", file=sys.stderr)
-        print(f"可重試：{retry_command(args.codex, args.preview)}", file=sys.stderr)
+        print(f"可重試：{retry_command(args.codex, args.preview, args.estimate)}", file=sys.stderr)
         return 1
 
 

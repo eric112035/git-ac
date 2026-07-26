@@ -18,7 +18,12 @@ if log_path:
     with open(log_path, "a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
-                {"backend": "aitext", "stage": stage, "stdin_bytes": len(prompt.encode("utf-8"))},
+                {
+                    "backend": "aitext",
+                    "stage": stage,
+                    "stdin_bytes": len(prompt.encode("utf-8")),
+                    "args": sys.argv[1:],
+                },
                 ensure_ascii=False,
             )
             + "\n"

@@ -86,11 +86,37 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(self.git("log", "-1", "--pretty=%B").stdout.strip(), "feat(core): 新增 staged 變更處理")
         calls = self.model_calls()
         self.assertEqual([(call["backend"], call["stage"]) for call in calls], [("aitext", "final")])
+        self.assertEqual(
+            calls[0]["args"],
+            [
+                "-m",
+                "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac",
+            ],
+        )
         self.assertIn("納入 AI 完整 diff 分析的檔案（1）", result.stderr)
         self.assertIn('A "app.txt"', result.stderr)
+        self.assertIn(
+            "aitext 模型：omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac",
+            result.stderr,
+        )
         self.assertIn("模型呼叫次數：1", result.stderr)
 
-    def test_codex_preview_is_isolated_and_keeps_index(self) -> None:
+    def test_local_model_environment_override_is_forwarded_only_to_aitext(self) -> None:
+        (self.repo / "override.txt").write_text("覆寫模型\n", encoding="utf-8")
+        self.git("add", "--", "override.txt")
+
+        result = self.run_cli(
+            "-p",
+            extra_env={"DEFAULT_GIT_AC_LOCAL_MODEL": "omlx:custom-local-model"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.model_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], ["-m", "omlx:custom-local-model"])
+        self.assertIn("aitext 模型：omlx:custom-local-model", result.stderr)
+
+    def test_codex_preview_is_isolated_disables_tools_and_keeps_index(self) -> None:
         (self.repo / "cloud.txt").write_text("雲端模式\n", encoding="utf-8")
         self.git("add", "--", "cloud.txt")
         before = self.git("write-tree").stdout.strip()
@@ -107,6 +133,8 @@ class GitAcIntegrationTests(unittest.TestCase):
         argv = calls[0]["args"]
         for expected in (
             "exec",
+            "--strict-config",
+            "--ignore-rules",
             "--ephemeral",
             "--ignore-user-config",
             "--sandbox",
@@ -117,16 +145,151 @@ class GitAcIntegrationTests(unittest.TestCase):
             "--output-last-message",
         ):
             self.assertIn(expected, argv)
+        config_overrides = [
+            argv[index + 1]
+            for index, argument in enumerate(argv[:-1])
+            if argument == "-c"
+        ]
+        self.assertEqual(
+            config_overrides,
+            ['approval_policy="never"', 'web_search="disabled"'],
+        )
+        disabled_features = [
+            argv[index + 1]
+            for index, argument in enumerate(argv[:-1])
+            if argument == "--disable"
+        ]
+        self.assertEqual(
+            disabled_features,
+            [
+                "shell_tool",
+                "shell_snapshot",
+                "multi_agent",
+                "apps",
+                "plugins",
+                "hooks",
+                "browser_use",
+                "computer_use",
+                "image_generation",
+            ],
+        )
         self.assertNotIn("aitext", [call["backend"] for call in calls])
 
-    def test_preview_requires_existing_staged_content(self) -> None:
+    def test_codex_preview_without_stage_uses_temporary_index(self) -> None:
+        (self.repo / "cloud-untracked.txt").write_text("雲端預覽\n", encoding="utf-8")
+
+        result = self.run_cli("-c", "-p")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("暫存 index 模擬 git add -A", result.stderr)
+        self.assertIn('A "cloud-untracked.txt"', result.stderr)
+        self.assertIn("fix(codex): 修正雲端訊息產生流程", result.stdout)
+        self.assertEqual(self.git("status", "--short").stdout, "?? cloud-untracked.txt\n")
+        self.assertEqual(self.commit_count(), 0)
+        calls = self.model_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["backend"], "codex")
+
+    def test_preview_without_stage_uses_temporary_index(self) -> None:
         (self.repo / "unstaged.txt").write_text("尚未加入\n", encoding="utf-8")
 
         result = self.run_cli("-p")
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("請先執行 git add", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("暫存 index 模擬 git add -A", result.stderr)
+        self.assertIn('A "unstaged.txt"', result.stderr)
+        self.assertIn("feat(core): 新增 staged 變更處理", result.stdout)
         self.assertFalse(self.git("diff", "--cached", "--quiet", check=False).returncode)
+        self.assertEqual(self.git("status", "--short").stdout, "?? unstaged.txt\n")
+        self.assertEqual(self.commit_count(), 0)
+        self.assertEqual(len(self.model_calls()), 1)
+
+    def test_estimate_without_stage_uses_temporary_index_without_writing_objects(self) -> None:
+        (self.repo / "unstaged.txt").write_text("尚未加入\n", encoding="utf-8")
+        objects_before = self.git("count-objects", "-v").stdout
+
+        result = self.run_cli("-e")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("暫存 index 模擬 git add -A", result.stdout)
+        self.assertIn('A "unstaged.txt"', result.stdout)
+        self.assertIn("分析檔案：1（完整分析 1，排除完整內容 0）", result.stdout)
+        self.assertIn("完整分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
+        self.assertEqual(self.git("status", "--short").stdout, "?? unstaged.txt\n")
+        self.assertEqual(self.git("count-objects", "-v").stdout, objects_before)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_estimate_temporary_index_uses_head_plus_tracked_and_untracked_changes(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("基準\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "test: 建立基準")
+        tracked.write_text("修改後\n", encoding="utf-8")
+        (self.repo / "untracked.txt").write_text("新增\n", encoding="utf-8")
+        index_before = self.git("write-tree").stdout.strip()
+        objects_before = self.git("count-objects", "-v").stdout
+
+        result = self.run_cli("-e")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('M "tracked.txt"', result.stdout)
+        self.assertIn('A "untracked.txt"', result.stdout)
+        self.assertIn("分析檔案：2（完整分析 2，排除完整內容 0）", result.stdout)
+        self.assertIn("完整分析文字異動：+2 / -1 行（合計 3 行）", result.stdout)
+        self.assertEqual(self.git("write-tree").stdout.strip(), index_before)
+        self.assertEqual(self.git("count-objects", "-v").stdout, objects_before)
+        status = self.git("status", "--short").stdout
+        self.assertIn(" M tracked.txt", status)
+        self.assertIn("?? untracked.txt", status)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_estimate_reports_scope_calls_and_recommendation_without_side_effects(self) -> None:
+        (self.repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.repo / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+        self.git("add", "-A")
+        before = self.git("write-tree").stdout.strip()
+        (self.repo / "untracked.txt").write_text("不要加入\n", encoding="utf-8")
+
+        result = self.run_cli("-e")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("git ac 估算結果", result.stdout)
+        self.assertIn("分析檔案：2（完整分析 1，排除完整內容 1）", result.stdout)
+        self.assertIn("完整分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
+        self.assertIn("處理方式：直接 final", result.stdout)
+        self.assertIn("預估模型呼叫：至少 1 次", result.stdout)
+        self.assertIn("規模判定：小型", result.stdout)
+        self.assertIn("建議使用本機 git ac", result.stdout)
+        self.assertIn('A "app.py"', result.stdout)
+        self.assertIn('A "package-lock.json"（lockfile）', result.stdout)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
+        self.assertIn("?? untracked.txt", self.git("status", "--short").stdout)
+        self.assertEqual(self.commit_count(), 0)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_long_estimate_option_reports_large_chunk_plan_without_model_calls(self) -> None:
+        content = "大型內容\n" + ("需要分塊的程式異動 abcdefghijklmnopqrstuvwxyz\n" * 2_000)
+        (self.repo / "large.py").write_text(content, encoding="utf-8")
+        self.git("add", "-A")
+
+        result = self.run_cli("--estimate", extra_env={"GIT_AC_CODEX_MAX_CALLS": "1"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"處理方式：\d+ 個 map chunks \+ 1 次 final")
+        self.assertRegex(result.stdout, r"預估模型呼叫：至少 [2-9]\d* 次")
+        self.assertIn("Codex 上限：超過目前 1 次上限", result.stdout)
+        self.assertIn("規模判定：超大型", result.stdout)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_estimate_rejects_preview_or_codex_combination(self) -> None:
+        (self.repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        self.git("add", "-A")
+
+        for arguments in (("-e", "-p"), ("-e", "-c")):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("不可與 -c 或 -p 同時使用", result.stderr)
         self.assertEqual(self.model_calls(), [])
 
     def test_no_staged_content_auto_stages_all_changes(self) -> None:
