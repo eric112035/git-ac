@@ -2,12 +2,23 @@
 
 `git ac` 會分析 Git 變更，產生一則繁體中文、符合 Conventional Commits 1.0.0 的 commit message，並建立單一 commit。
 
+## 專案目標
+
+- 預設使用本機模型，diff 不離開電腦；只有明確執行 `git ac -c` 才使用 Codex。
+- 尊重使用者決定的 staged 邊界，無論變更大小都只建立一個 commit，不由 AI 自動 staging 或拆分 commit。
+- 小型 diff 直接產生訊息，大型 diff 自動依檔案、hunk 與行切塊，再以 recursive map-reduce 彙整；不以總 diff bytes 作為拒絕提交的固定上限。
+- 最終訊息必須通過 Conventional Commits、繁體中文與安全格式驗證；任一後端失敗時中止並保留 staged 內容，不自動切換本機或雲端後端。
+
+## 執行架構
+
 它提供兩個模型後端：
 
-- `git ac`：使用本機 `aitext`／oMLX，預設指定 `mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac` profile。
-- `git ac -c`：使用官方 Codex CLI，預設模型為 `gpt-5.3-codex-spark`。
+- `git ac`：`git-ac` → 自製 `aitext` wrapper → `aichat` → oMLX → 本機模型。預設指定 `mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac` profile。
+- `git ac -c`：`git-ac` → 官方 `codex exec` → OpenAI。預設模型為 `gpt-5.3-codex-spark`。
 
 兩個後端共用相同的 staged 邊界、排除規則、大型 diff 分塊、訊息格式驗證與 snapshot 安全檢查，主要差異是隱私、速度及 Codex 額度成本。
+
+本機路徑中的 [`aichat`](https://github.com/sigoden/aichat) 是連接 OpenAI-compatible endpoint 的通用 CLI；本專案的 `aitext` 則是很薄的輸入／輸出包裝層，不負責載入模型或保存 endpoint 設定。Codex 路徑直接使用官方 CLI，不經 `aichat`、`aitext` 或 `CLIProxyAPI`，以減少額外代理、OAuth 相容性與請求格式風險。
 
 ## 前置設定
 
@@ -30,7 +41,7 @@ zsh --version
   git config --global user.email "you@example.com"
   ```
 
-- 使用本機模式時，需安裝可執行的 `aitext`，並完成下方的 `aichat`／oMLX profile 設定。
+- 使用本機模式時，需先完成下方的 oMLX 與 `aichat` 設定，再用 `scripts/setup-aitext.sh` 安裝本專案的 `aitext` wrapper。
 - 使用 `-c` 時，需安裝官方 `codex` CLI 並完成登入。
 - 只有開發及執行測試時需要 `uv`；安裝後的日常指令不依賴 `uv`。
 
@@ -46,6 +57,8 @@ exec zsh
 ./scripts/setup-git-ac.sh check
 git ac -h
 ```
+
+以上流程會安裝 `git-ac` 本身。若要使用預設的本機模式，還要完成「[本機 aichat／aitext／oMLX 設定](#本機-aichataitextomlx-設定)」；只使用 `git ac -c` 時可略過本機後端。
 
 省略參數時預設也是 `install`：
 
@@ -142,6 +155,26 @@ git ac -e -p  # 無效
 |`git ac -c`|Codex|是|實際執行 `git add -A` 後建立 commit|
 
 先執行 `-p` 再正式執行會呼叫模型兩次，而且兩次訊息可能不同。只想判斷規模時應使用 `git ac -e`。
+
+## Commit message 格式
+
+標題固定為：
+
+```text
+<type>[optional scope][!]: <繁體中文描述>
+```
+
+允許的 `type` 為：
+
+```text
+build chore ci docs feat fix perf refactor revert style test
+```
+
+- `type` 與技術性 `scope` 可保留英文；description 與一般 body 必須包含繁體中文。
+- body 為選用，存在時必須和標題間保留一個空白行。
+- breaking change 可用標題中的 `!`、`BREAKING CHANGE: <繁體中文說明>` footer，或兩者同時使用。
+- 支援 `Refs:`、`Closes:`、`Fixes:` 與 `Relates-to:` 等 footer。
+- code fence、模型前言、重複標題、空訊息與未允許的 type 都會被拒絕；驗證失敗時不建立 commit。
 
 ## 建議的日常流程
 
@@ -433,15 +466,67 @@ timeout 套用於每一次模型呼叫，不是整次命令總時間。提高 Co
 GIT_AC_CODEX_MAX_CALLS=20 git ac -c
 ```
 
-## 本機 aitext／oMLX 設定
+## 本機 aichat／aitext／oMLX 設定
 
-本機模式固定透過以下命令呼叫 `aitext`，不影響平常直接使用 `aitext` 時的預設模型：
+### 三個元件的責任
+
+- [oMLX](https://github.com/jundot/omlx) 載入 Apple Silicon 上的本機模型，並提供 `http://localhost:8000/v1` OpenAI-compatible API。
+- [`aichat`](https://github.com/sigoden/aichat) 讀取 client／model 設定，把 `git-ac` 的 prompt 傳給 oMLX，並串流回傳模型輸出。
+- `aitext` 是本專案放在 `src/aitext` 的 Bash wrapper。它把參數與 stdin 原樣交給 `aichat`、移除串流中的 `<think>...</think>`、避免無輸入時意外進入 REPL、保留 `aichat` exit code，並把輸出結尾正規化為單一換行。它不保存 API endpoint、模型或憑證。
+
+`git ac` 固定執行以下命令，因此不會改變平常直接使用 `aichat` 或 `aitext` 時的預設模型：
 
 ```sh
 aitext -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
 ```
 
-在 `aichat` 的 `omlx` client 登錄 git 專用 profile，並只對這個 model ID 注入輸出與取樣設定：
+### 1. 準備 oMLX 與 git-ac profile
+
+依 [oMLX 官方安裝說明](https://github.com/jundot/omlx#install) 安裝 macOS App，或使用 Homebrew：
+
+```sh
+brew tap jundot/omlx https://github.com/jundot/omlx
+brew install omlx
+brew services start omlx
+```
+
+在 oMLX 下載 `mlx-community/gemma-4-26B-A4B-it-qat-4bit`，確認 API 位於 `http://localhost:8000/v1`，並建立 `git-ac` profile：
+
+|設定|建議值|
+|---|---|
+|模型類型|自動偵測|
+|Reasoning Parser|`None`|
+|CTX WINDOW|131,072|
+|最大 TOKEN 數|1,024|
+|溫度|0|
+|TOP P／TOP K／MIN P|0.95／64／0|
+|重複懲罰／Presence Penalty|1／0|
+|啟用思考|關閉|
+|思考 Token 限制|關閉|
+|Guided Grammar|關閉|
+|限制工具回傳 Token 數|關閉；`git ac` 不使用 tool calls|
+|強制取樣|關閉|
+
+profile 名稱本身不會自動關閉 thinking 或套用取樣參數，以上數值仍須在 oMLX 儲存。temperature 為 0 時，top-p、top-k 與 min-p 的影響有限，可維持模型原值。
+
+TTL 只控制模型閒置多久後卸載，不限制單次推論。沿用全域 1,800 秒可減少短時間重複載入；若希望更快釋放模型記憶體，可在 `git-ac` profile 改為 60～300 秒。
+
+### 2. 安裝並設定 aichat
+
+依 [`aichat` 官方說明](https://github.com/sigoden/aichat#install) 安裝；macOS 可使用：
+
+```sh
+brew install aichat
+aichat --version
+```
+
+用以下命令確認實際設定檔位置；macOS 預設是 `~/Library/Application Support/aichat/config.yaml`：
+
+```sh
+aichat --info | rg 'config_file'
+```
+
+將以下 `omlx` client 合併到既有 `config.yaml` 的 `clients` 清單，不要覆寫其他 client 或個人設定。若 oMLX 啟用了 API key，另依 `aichat` 官方機密管理方式設定，不要把 key 寫進本 repository。
 
 ```yaml
 clients:
@@ -473,26 +558,48 @@ clients:
 max_tokens=1024, request_max_tokens=1024
 ```
 
-oMLX 的 `git-ac` profile 建議值：
+先直接驗證 `aichat` 能連到 profile；這一步會執行一次本機推論：
 
-|設定|建議值|
+```sh
+printf '只輸出：本機模型設定成功\n' | \
+  aichat -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
+```
+
+### 3. 安裝 aitext wrapper
+
+`aichat` 驗證成功後，在本 repository 根目錄執行獨立設定腳本：
+
+```sh
+./scripts/setup-aitext.sh install
+exec zsh
+./scripts/setup-aitext.sh check
+```
+
+腳本會確認 macOS、`aichat`、Bash 與 Perl 可用，將 `src/aitext` 安裝成 `$HOME/bin/aitext`，並共用 `setup-git-ac.sh` 的 `~/.zshrc` PATH 管理區塊。它不會修改 `aichat` config、oMLX profile 或模型檔案。
+
+|參數|行為|
 |---|---|
-|模型類型|自動偵測|
-|Reasoning Parser|`None`|
-|CTX WINDOW|131,072|
-|最大 TOKEN 數|1,024|
-|溫度|0|
-|TOP P／TOP K／MIN P|0.95／64／0|
-|重複懲罰／Presence Penalty|1／0|
-|啟用思考|關閉|
-|思考 Token 限制|關閉|
-|Guided Grammar|關閉|
-|限制工具回傳 Token 數|關閉；`git ac` 不使用 tool calls|
-|強制取樣|關閉|
+|`install`|首次安裝 wrapper 並補上 PATH 管理區塊；預設動作|
+|`update`|以 repository 的 `src/aitext` 明確更新既有 `$HOME/bin/aitext`|
+|`check`|檢查依賴、來源一致性、PATH 區塊與 `aitext --version`|
+|`help`、`-h`、`--help`|顯示設定腳本說明|
 
-profile 名稱本身不會自動關閉 thinking 或套用取樣參數，以上數值仍須在 oMLX 儲存。temperature 為 0 時，top-p、top-k 與 min-p 的影響有限，可維持模型原值。
+若 `$HOME/bin/aitext` 已存在且內容不同，`install` 會在修改 `.zshrc` 前中止，不會覆寫；先自行備份或確認該檔案可移除。日後 repository 更新 wrapper 時執行：
 
-TTL 只控制模型閒置多久後卸載，不限制單次推論。沿用全域 1,800 秒可減少短時間重複載入；若希望更快釋放模型記憶體，可在 `git-ac` profile 改為 60～300 秒。
+```sh
+./scripts/setup-aitext.sh update
+./scripts/setup-aitext.sh check
+```
+
+### 4. 驗證完整本機路徑
+
+第一個命令會經過 `aitext` → `aichat` → oMLX；接著在有 staged 測試變更的 Git repository 執行預覽，驗證 `git-ac` 整合。兩者都會執行本機推論：
+
+```sh
+printf '只輸出：aitext 設定成功\n' | \
+  aitext -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
+git ac -p
+```
 
 完成一次本機呼叫後可檢查：
 
@@ -673,7 +780,17 @@ TMPDIR="$PWD/.test-workspace/tmp" \
   --output .test-workspace/local-large.json
 ```
 
-每次修改 `src/git_ac.py` 都必須檢查本 README；只要參數、環境變數、輸出、前置需求、staging 邊界、安裝／更新、錯誤行為或使用流程有變動，就要在同一個變更中同步更新。README 是唯一的使用者文件，不另建 `docs/` 或獨立 usage guide。
+### 發行驗收政策
+
+1. 每次共用流程變更先通過完整離線單元、fake 後端、150 KB 單檔與 1 MB 多檔案例；所有大型案例都必須保持 staged snapshot 並只建立一個 commit。
+2. 發行本機後端前，另以真實 `aitext` → `aichat` → oMLX 驗證小型 preview／commit、大型多層彙整及排除內容；fake `aitext` 只能證明 orchestration，不能取代這一層。
+3. 發行 Codex 後端前，以合成資料驗證真實 `codex exec`、呼叫上限、隔離參數與單一 commit；日常離線測試不得消耗 Codex 額度。
+4. 變更 Codex 預設模型前，使用至少 20 個具 ground truth 的案例，每個模型各執行 3 次。硬性門檻為格式通過率 100%、breaking change 判定 100%、必要事實涵蓋率至少 95%、虛構事實 0，且所有大型案例只建立一個 commit。
+5. 模型選擇是版本化的整體決策，不依單一 diff 臨時切換。候選模型只有在通過所有硬性門檻，且必要事實涵蓋率和對照模型差距不超過 2 個百分點時，才可成為預設。
+
+真實後端具有非決定性，驗收應記錄日期、模型 slug、CLI／`aichat` 版本、案例、耗時與結果，不以單一參考句做完全相等比較。
+
+每次修改 `src/git_ac.py`、`src/aitext` 或設定腳本都必須檢查本 README；只要參數、環境變數、輸出、前置需求、staging 邊界、安裝／更新、錯誤行為或使用流程有變動，就要在同一個變更中同步更新。README 是唯一的使用者文件，不另建 `docs/` 或獨立 usage guide。
 
 ## 已完成的驗收參考
 

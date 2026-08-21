@@ -717,7 +717,9 @@ class LocalBackend:
         self.timeout = timeout
         self.model = model
         if shutil.which("aitext") is None:
-            raise GitAcError("找不到 aitext；請確認本機 oMLX 工具已安裝並位於 PATH。")
+            raise GitAcError(
+                "找不到 aitext；請依 README 設定 aichat／oMLX 並安裝 aitext wrapper。"
+            )
 
     def invoke(self, prompt: str, stage: str) -> str:
         try:

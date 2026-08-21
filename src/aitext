@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# aitext — aichat 包裝層
+#   - 串流剝除 <think>...</think>，think 之後的內容即時逐塊輸出
+#   - 結構上不可能進入 REPL（無 stdin 且無參數時直接退出）
+#   - 保留 aichat 的 exit code
+#   - 結尾補單一換行，避免 zsh 顯示 %
+
+if [ -t 0 ] && [ "$#" -eq 0 ]; then
+  echo "aitext: 需要 stdin 輸入或文字參數" >&2
+  exit 2
+fi
+
+# 串流過濾器：逐塊讀取，丟棄 think 區塊，其餘即時 flush。
+# 注意：assignment 必須用單引號，避免 bash 展開 $buf / $| 等。
+strip='
+use strict; use warnings;
+binmode STDIN; binmode STDOUT;
+$| = 1;                                  # autoflush，逐塊即時輸出
+my ($buf, $in, $started, $lastch) = ("", 0, 0, "");
+my $chunk;
+while (sysread(STDIN, $chunk, 65536)) {  # sysread：有資料就回，不等湊滿
+    $buf .= $chunk;
+    while (1) {
+        if (!$in) {
+            if ($buf =~ /<think>/) {                       # 進入 think
+                emit(substr($buf, 0, $-[0]));
+                $buf = substr($buf, $+[0]);
+                $in = 1; next;
+            }
+            # 留住最多 6 字（"<think>" 的最長前綴），其餘即時吐出
+            if (length($buf) > 6) {
+                emit(substr($buf, 0, length($buf) - 6));
+                $buf = substr($buf, length($buf) - 6);
+            }
+            last;
+        } else {
+            if ($buf =~ m{</think>}) {                      # 離開 think
+                $buf = substr($buf, $+[0]);
+                $buf =~ s/\A\s+//;                          # 砍掉緊接的空白
+                $in = 0; next;
+            }
+            # think 內全丟，只留 7 字偵測 "</think>"
+            if (length($buf) > 7) { $buf = substr($buf, length($buf) - 7); }
+            last;
+        }
+    }
+}
+emit($buf) if !$in;                      # 收尾：think 外的殘餘
+print "\n" if $started && $lastch ne "\n";  # 補單一換行，消掉 zsh 的 %
+
+sub emit {
+    my ($s) = @_;
+    return unless length $s;
+    if (!$started) {                     # 砍掉整體開頭空白
+        $s =~ s/\A\s+//;
+        return unless length $s;
+        $started = 1;
+    }
+    print $s;
+    $lastch = substr($s, -1);
+}
+'
+
+if [ -t 0 ]; then
+  command aichat "$@" </dev/null | perl -e "$strip"
+else
+  command aichat "$@" | perl -e "$strip"
+fi
+exit "${PIPESTATUS[0]}"
