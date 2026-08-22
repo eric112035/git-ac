@@ -19,7 +19,7 @@ if log_path:
         handle.write(
             json.dumps(
                 {
-                    "backend": "aitext",
+                    "backend": "aichat",
                     "stage": stage,
                     "stdin_bytes": len(prompt.encode("utf-8")),
                     "args": sys.argv[1:],

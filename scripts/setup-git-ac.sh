@@ -99,7 +99,7 @@ install_all() {
   print -r -- "安裝完成：${TARGET_FILE}"
   print -r -- "已設定：${ZSHRC_FILE}（${BIN_DIR} 加入 PATH）"
   print -r -- "已設定：git config --global alias.ac '${ALIAS_VALUE}'"
-  print -r -- "請執行 exec zsh，再以 git ac -h 驗證。"
+  print -r -- '請在目前終端執行 source ~/.zshrc（或 exec zsh），再以 git ac -h 驗證。'
 }
 
 update_binary() {
@@ -120,7 +120,7 @@ check_installation() {
 
   print -r -- "檢查完成：git-ac 執行檔、PATH 設定、Git alias 與 git ac -h 均有效。"
   if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
-    print -u2 -r -- "目前 shell 尚未載入 ${BIN_DIR}；請執行 exec zsh。"
+    print -u2 -r -- "目前 shell 尚未載入 ${BIN_DIR}；請執行 source ~/.zshrc（或 exec zsh）。"
   fi
 }
 

@@ -99,7 +99,7 @@ install_all() {
 
   print -r -- "安裝完成：${TARGET_FILE}"
   print -r -- "已確認：aichat 與 Perl 可執行"
-  print -r -- "請執行 exec zsh，再以 ./scripts/setup-aitext.sh check 驗證。"
+  print -r -- '請在目前終端執行 source ~/.zshrc（或 exec zsh），再以 ./scripts/setup-aitext.sh check 驗證。'
 }
 
 update_wrapper() {
@@ -120,7 +120,7 @@ check_installation() {
 
   print -r -- "檢查完成：aichat、aitext wrapper、Perl 與 PATH 設定均有效。"
   if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
-    print -u2 -r -- "目前 shell 尚未載入 ${BIN_DIR}；請執行 exec zsh。"
+    print -u2 -r -- "目前 shell 尚未載入 ${BIN_DIR}；請執行 source ~/.zshrc（或 exec zsh）。"
   fi
 }
 

@@ -1,108 +1,171 @@
 # git-ac
 
-`git ac` 會分析 Git 變更，產生一則繁體中文、符合 Conventional Commits 1.0.0 的 commit message，並建立單一 commit。
+`git ac` 會分析 Git 變更，產生繁體中文且符合 Conventional Commits 1.0.0 的 commit message，並建立單一 commit。
 
-## 專案目標
+## 快速上手
 
-- 預設使用本機模型，diff 不離開電腦；只有明確執行 `git ac -c` 才使用 Codex。
-- 尊重使用者決定的 staged 邊界，無論變更大小都只建立一個 commit，不由 AI 自動 staging 或拆分 commit。
-- 小型 diff 直接產生訊息，大型 diff 自動依檔案、hunk 與行切塊，再以 recursive map-reduce 彙整；不以總 diff bytes 作為拒絕提交的固定上限。
-- 最終訊息必須通過 Conventional Commits、繁體中文與安全格式驗證；任一後端失敗時中止並保留 staged 內容，不自動切換本機或雲端後端。
+### 1. 安裝 git-ac
 
-## 執行架構
-
-它提供兩個模型後端：
-
-- `git ac`：`git-ac` → 自製 `aitext` wrapper → `aichat` → oMLX → 本機模型。預設指定 `mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac` profile。
-- `git ac -c`：`git-ac` → 官方 `codex exec` → OpenAI。預設模型為 `gpt-5.3-codex-spark`。
-
-兩個後端共用相同的 staged 邊界、排除規則、大型 diff 分塊、訊息格式驗證與 snapshot 安全檢查，主要差異是隱私、速度及 Codex 額度成本。
-
-本機路徑中的 [`aichat`](https://github.com/sigoden/aichat) 是連接 OpenAI-compatible endpoint 的通用 CLI；本專案的 `aitext` 則是很薄的輸入／輸出包裝層，不負責載入模型或保存 endpoint 設定。Codex 路徑直接使用官方 CLI，不經 `aichat`、`aitext` 或 `CLIProxyAPI`，以減少額外代理、OAuth 相容性與請求格式風險。
-
-## 前置設定
-
-本專案只考慮 macOS 與 zsh。安裝前請確認：
-
-```sh
-git --version
-python3 --version
-zsh --version
-```
-
-必要條件：
-
-- macOS、zsh 與 Git。
-- Python 3.11 以上。安裝後的 `~/bin/git-ac` 會透過 `/usr/bin/env python3` 執行，不需要額外 Python 套件。
-- Git commit 身分已設定：
-
-  ```sh
-  git config --global user.name "Your Name"
-  git config --global user.email "you@example.com"
-  ```
-
-- 使用本機模式時，需先完成下方的 oMLX 與 `aichat` 設定，再用 `scripts/setup-aitext.sh` 安裝本專案的 `aitext` wrapper。
-- 使用 `-c` 時，需安裝官方 `codex` CLI 並完成登入。
-- 只有開發及執行測試時需要 `uv`；安裝後的日常指令不依賴 `uv`。
-
-`git ac -e` 不呼叫模型，因此即使尚未安裝 `aitext` 或 `codex` 也能使用。
-
-## macOS 快速安裝
-
-先進入 clone 下來的專案根目錄，再執行：
+在 repository 根目錄執行：
 
 ```sh
 ./scripts/setup-git-ac.sh install
-exec zsh
+source ~/.zshrc
 ./scripts/setup-git-ac.sh check
 git ac -h
 ```
 
-以上流程會安裝 `git-ac` 本身。若要使用預設的本機模式，還要完成「[本機 aichat／aitext／oMLX 設定](#本機-aichataitextomlx-設定)」；只使用 `git ac -c` 時可略過本機後端。
+### 2. 選擇並準備 backend
 
-省略參數時預設也是 `install`：
+請依需求選擇以下其中一條路徑。只有 aichat backend 需要安裝 `aichat` 與 `aitext`；Codex 和 Claude Code 都不經過這兩個工具。
+
+|想使用的服務|Backend|需要準備|
+|---|---|---|
+|oMLX、本機 model 或自訂 aichat provider|`aichat`|aichat、有效 model/client、`aitext`|
+|OpenAI Codex|`codex`|已安裝並登入的 Codex CLI|
+|Anthropic Claude Code|`claude`|已安裝並登入的 Claude Code CLI|
+
+#### 路徑 A：aichat（可使用本機或雲端 model）
+
+適合已經有 aichat 設定，或願意自行設定 oMLX 等本機 OpenAI-compatible endpoint／其他 provider 的使用者。
+
+先安裝 aichat：
 
 ```sh
-./scripts/setup-git-ac.sh
+brew install aichat
+aichat --version
 ```
 
-安裝腳本會：
+第一次執行 `aichat` 時，依提示建立設定；也可以依 [AIChat Configuration Guide](https://github.com/sigoden/aichat/wiki/Configuration-Guide) 自行設定 client、endpoint 與預設 model：
 
-1. 將 `src/git_ac.py` 複製成 `$HOME/bin/git-ac` 並設定為 `755`。
-2. 在 `~/.zshrc` 加入有明確起訖標記的 `$HOME/bin` PATH 設定。
-3. 以 `git config --global alias.ac '!git-ac'` 設定使用者層級 Git alias。
-4. 保留其他 `.zshrc` 與 `.gitconfig` 內容。
+```sh
+aichat
+aichat --info
+aichat --list-models
+```
 
-在使用者 `eric` 的 Mac 上，實際安裝位置就是：
+若要使用本機 model，必須先啟動 oMLX 或其他本機服務，並在 aichat 中設定相應 endpoint 與 model。若 aichat 指向雲端 provider，diff 也會送往該 provider；選擇 `aichat` 不代表資料一定留在本機。
+
+aichat 可以正常回應後，再安裝 git-ac 的 `aitext` wrapper：
+
+```sh
+./scripts/setup-aitext.sh install
+./scripts/setup-aitext.sh check
+git ac config set backend aichat
+git ac config check
+```
+
+git-ac 產生 commit message 時的實際路徑是：
 
 ```text
-/Users/eric/bin/git-ac
+git-ac → aitext → aichat → aichat 設定的 client／endpoint
 ```
 
-其他使用者會自動安裝到 `/Users/<使用者名稱>/bin/git-ac`，不需要修改腳本。
+沒有指定 aichat model override 時，`aitext` 不會傳 `-m`，直接沿用 `aichat --info` 顯示的預設 model。
 
-若全域 `alias.ac` 已存在而且不是 `!git-ac`，腳本會在修改任何設定前中止，不會靜默覆寫。先自行確認並更名或移除既有 alias，再重新執行：
+#### 路徑 B：Codex
+
+適合希望直接使用 OpenAI Codex CLI 的使用者，不需要安裝 aichat 或 `aitext`。
+
+依 [OpenAI Docs 的 Codex CLI quickstart](https://developers.openai.com/codex/cli/) 安裝 CLI：
 
 ```sh
-git config --global --get alias.ac
-git config --global --unset alias.ac
-./scripts/setup-git-ac.sh install
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+codex --version
 ```
 
-`--unset` 會刪除既有 alias，只有確定不再需要原設定時才執行。
+進入任一 Git repository 執行 `codex`，依畫面選擇登入方式：
 
-### 設定腳本參數
+```sh
+codex
+```
 
-|參數|行為|
-|---|---|
-|`install`|安裝或重新安裝執行檔，補上 `.zshrc` PATH 區塊，並設定全域 `alias.ac`；預設動作|
-|`update`|只以目前 repository 的 `src/git_ac.py` 更新既有 `$HOME/bin/git-ac`|
-|`check`|檢查執行檔、`.zshrc` 管理區塊、全域 alias 與 `git-ac -h`|
-|`help`、`-h`、`--help`|顯示設定腳本說明|
+完成登入後，將 Codex 設為 git-ac 預設 backend：
 
-### 更新已安裝的 git-ac
+```sh
+git ac config set backend codex
+git ac config check
+git ac config get backend
+git ac config get model codex
+```
 
-repository 取得新版 `git_ac.py` 後，執行：
+未設定 model 時使用 `gpt-5.6-luna`。如果不想改預設，也可以只在單次執行使用 `git ac -c`。
+
+#### 路徑 C：Claude Code
+
+適合希望直接使用 Anthropic Claude Code 的使用者，不需要安裝 aichat 或 `aitext`。
+
+依 [Claude Code Quickstart](https://code.claude.com/docs/en/quickstart) 安裝 CLI：
+
+```sh
+brew install --cask claude-code
+claude --version
+```
+
+執行 `claude` 並依畫面完成登入；需要時可在互動介面使用 `/login`：
+
+```sh
+claude
+```
+
+完成登入後，將 Claude Code 設為 git-ac 預設 backend：
+
+```sh
+git ac config set backend claude
+git ac config check
+git ac config get backend
+git ac config get model claude
+```
+
+未設定 model 時使用 `haiku` alias。如果不想改預設，也可以只在單次執行使用 `git ac --claude`。
+
+### 3. 第一次 preview 與 commit
+
+完成任一 backend 路徑後，進入要提交的 Git repository：
+
+```sh
+cd /path/to/your/repository
+git ac config show
+git ac -e
+git ac -p
+git ac
+```
+
+- `git ac -e`：只估算規模，不呼叫模型。
+- `git ac -p`：用目前的預設 backend 產生 preview，不建立 commit。
+- `git ac`：產生訊息並建立 commit。
+- `git ac -c -p`：改用 Codex 產生 preview。
+- `git ac --claude -p`：改用 Claude Code 產生 preview。
+- `git ac --backend aichat -p`：改用 aichat 產生 preview。
+
+若目前已有 staged 內容，只會分析及提交該 staged snapshot。若沒有 staged 內容，`-p`／`-e` 只會在隔離 index 模擬 `git add -A`；正式 `git ac` 則會在 backend preflight 成功後執行 `git add -A`。
+
+指定 type 或提供參考資訊：
+
+```sh
+git ac -p -t fix
+git ac -p -m "修正登入逾時，對應 issue #123"
+git ac -p -t feat -m "新增可切換的 backend 設定"
+```
+
+### 4. 切換或查看預設 backend
+
+```sh
+git ac config show
+git ac config get backend
+
+git ac config set backend codex
+git ac config set backend claude
+git ac config set backend aichat
+
+git ac config unset backend
+```
+
+`config unset backend` 會恢復內建預設 `aichat`。如果該電腦沒有安裝及設定 aichat，請明確設定 `codex` 或 `claude`，或每次使用 `-c`／`--claude`。
+
+### 5. 更新已安裝版本
+
+repository 取得新版後執行：
 
 ```sh
 git pull --ff-only
@@ -110,699 +173,390 @@ git pull --ff-only
 ./scripts/setup-git-ac.sh check
 ```
 
-`update` 不會重寫 `.zshrc` 或 `.gitconfig`，只會快速更新 `$HOME/bin/git-ac`。如果尚未安裝，會要求先執行 `install`。
-
-若不想使用腳本，也可以手動完成相同設定：
-
-```sh
-mkdir -p "$HOME/bin"
-install -m 755 src/git_ac.py "$HOME/bin/git-ac"
-printf '\nexport PATH="$HOME/bin:$PATH"\n' >> "$HOME/.zshrc"
-git config --global alias.ac '!git-ac'
-exec zsh
-```
-
-手動做法不會偵測重複 PATH 或 alias 衝突，建議優先使用設定腳本。
-
-## git ac 指令參數
-
-```text
-git ac [-h] [-c] [-p] [-e]
-```
-
-|參數|完整名稱|指令說明|
-|---|---|---|
-|`-h`|`--help`|顯示 help 後結束|
-|`-c`|—|改用官方 Codex CLI；未指定時使用本機 `aitext`／oMLX|
-|`-p`|—|只預覽模型產生的 commit message，不建立 commit，也不改變真實 index|
-|`-e`|`--estimate`|估算分析規模、分塊與最低模型呼叫數；不呼叫模型、不建立 commit，也不改變真實 index|
-
-`-e` 不可與 `-c` 或 `-p` 同時使用：
-
-```sh
-git ac -e -c  # 無效
-git ac -e -p  # 無效
-```
-
-常用組合：
-
-|指令|呼叫模型|建立 commit|無 staged 時的行為|
-|---|---|---|---|
-|`git ac -e`|否|否|以隔離的暫存 index 模擬全部變更|
-|`git ac -p`|本機|否|以隔離的暫存 index 模擬全部變更|
-|`git ac -c -p`|Codex|否|以隔離的暫存 index 模擬全部變更|
-|`git ac`|本機|是|實際執行 `git add -A` 後建立 commit|
-|`git ac -c`|Codex|是|實際執行 `git add -A` 後建立 commit|
-
-先執行 `-p` 再正式執行會呼叫模型兩次，而且兩次訊息可能不同。只想判斷規模時應使用 `git ac -e`。
-
-## Commit message 格式
-
-標題固定為：
-
-```text
-<type>[optional scope][!]: <繁體中文描述>
-```
-
-允許的 `type` 為：
-
-```text
-build chore ci docs feat fix perf refactor revert style test
-```
-
-- `type` 與技術性 `scope` 可保留英文；description 與一般 body 必須包含繁體中文。
-- body 為選用，存在時必須和標題間保留一個空白行。
-- breaking change 可用標題中的 `!`、`BREAKING CHANGE: <繁體中文說明>` footer，或兩者同時使用。
-- 支援 `Refs:`、`Closes:`、`Fixes:` 與 `Relates-to:` 等 footer。
-- code fence、模型前言、重複標題、空訊息與未允許的 type 都會被拒絕；驗證失敗時不建立 commit。
-
-## 建議的日常流程
-
-想估算目前所有尚未提交的變更，直接執行：
-
-```sh
-git ac -e
-```
-
-不需要先執行 `git add`。如果只想分析特定 commit 範圍，才先 staging：
-
-```sh
-git add <這次要提交的檔案>
-git ac -e
-```
-
-再依估算結果選擇：
-
-```sh
-git ac       # 本機模型並建立 commit
-git ac -c    # Codex Spark 並建立 commit
-```
-
-只想先看 commit message：
-
-```sh
-git ac -p       # 本機預覽
-git ac -c -p    # Codex 預覽
-```
-
-選擇原則：
-
-```text
-git ac -e
-    ↓
-小型或敏感內容 → git ac
-中大型且非敏感 → git ac -c
-超大型 → 優先拆分 commit
-```
-
-## Staging 邊界
-
-`git ac` 永遠優先尊重目前已 staged 的內容。
-
-|執行前狀態|指令|行為|
-|---|---|---|
-|已有 staged 變更|`git ac`|只分析及提交既有 staged snapshot|
-|已有 staged，另有 unstaged／untracked|`git ac`|不會加入 unstaged／untracked|
-|沒有 staged，但 working tree 有異動|`git ac`|實際執行 `git add -A` 後 commit|
-|已有 staged|`git ac -p`|只預覽既有 staged snapshot|
-|沒有 staged|`git ac -p`|暫存模擬 `git add -A` 後預覽，真實 index 不變|
-|已有 staged|`git ac -e`|只估算既有 staged snapshot|
-|沒有 staged|`git ac -e`|暫存模擬 `git add -A` 後估算，真實 index 不變|
-
-### 分析全部變更
-
-不需要先 staging：
-
-```sh
-git ac -e
-git ac -p
-```
-
-兩者都會用隔離的暫存 index 模擬所有變更。後續正式執行 `git ac` 才會真的執行 `git add -A` 並建立 commit。
-
-### 只分析部分檔案
-
-先手動 staging：
-
-```sh
-git add src/login.py tests/test_login.py
-git ac -e
-git ac
-```
-
-即使工作目錄還有其他 unstaged 或 untracked 檔案，也不會混入這次估算及 commit。
-
-## Estimate 估算模式
-
-```sh
-git ac -e
-git ac --estimate
-```
-
-估算模式使用正式執行的同一套檔案納入／排除規則、diff 組裝、prompt 大小限制、map chunk 規劃與 Codex 呼叫上限，但不會：
-
-- 呼叫本機模型或 Codex。
-- 建立 commit。
-- 對真實 index 執行 `git add -A`。
-- 改變真實 staged snapshot。
-- 在專案 `.git/objects` 留下暫存物件。
-- 要求 `aitext` 或 `codex` 已安裝。
-
-如果目前沒有 staged 內容，例如：
-
-```text
- M src/app.py
-?? tests/test_app.py
-```
-
-工具會建立隔離的暫存 index 與 Git object database，在其中模擬 `git add -A`，分析 tracked、unstaged 與 untracked 變更，完成後刪除暫存環境。終端會顯示：
-
-```text
-目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。
-```
-
-執行後原本的 `git status --short` 不會改變。
-
-### 估算輸出
-
-```text
-納入 AI 完整 diff 分析的檔案（18）：
-  M "src/app.py"
-  A "src/config.py"
-  ...
-
-排除完整內容、只提供狀態與路徑的檔案（3）：
-  M "package-lock.json"（lockfile）
-  D "src/legacy.py"（刪除檔案）
-
-git ac 估算結果：
-  分析檔案：21（完整分析 18，排除完整內容 3）
-  完整分析文字異動：+1240 / -318 行（合計 1558 行）
-  有效分析內容：174.2 KiB
-  處理方式：4 個 map chunks + 1 次 final
-  預估模型呼叫：至少 5 次
-  Codex 上限：在目前 12 次上限內
-  規模判定：大型
-  建議：內容不敏感且重視速度時，建議使用 git ac -c；敏感內容仍使用本機 git ac。
-```
-
-日常判斷以完整分析檔案數、排除檔案數、增刪行數、map chunk 數、最低模型呼叫數、規模判定及建議為主。KiB 用來輔助辨識大型 JSON、SQL、長字串、單行產生檔等「行數少但 bytes 很大」的內容。
-
-### 規模判定
-
-`git ac -e` 採 OR 判定，只要符合其中一項就提高規模等級。
-
-|規模|判定條件|一般建議|
-|---|---|---|
-|小型|完整分析檔案不超過 5 個、合計不超過 300 行、可直接 final|`git ac`|
-|中型|超過 5 個檔案、超過 300 行，或需要 1～3 個 map chunks|本機可處理；非敏感且重視速度可用 `git ac -c`|
-|大型|超過 20 個檔案、超過 1,000 行，或至少 4 個 map chunks|非敏感內容建議 `git ac -c`|
-|超大型|Codex 最低預估呼叫數超過目前上限|優先拆分 commit 或使用本機；確認成本後才提高上限|
-
-規模建議不是安全決策。敏感、受公司政策限制或不能送到雲端的內容，不論規模都應使用本機 `git ac`。
-
-### 不只看行數的例外
-
-- Lockfile、minified 與二進位檔不會展開完整內容，行數大不一定增加模型負擔。
-- Snapshot、fixture 與自動產生資料資訊密度較低，可考慮獨立 commit。
-- 跨模組 rename 或架構重構即使行數不大，也需要理解更多檔案關聯；非敏感時可偏向 `git ac -c`。
-- 大型 JSON 或 SQL 可能行數少但單行很長，此時 map chunk 數比行數可靠。
-- 混合多個變更目的時，即使模型能處理，也應先拆成多個明確 commit。
-
-## Preview 預覽模式
-
-```sh
-git ac -p
-git ac -c -p
-```
-
-`-p` 會呼叫模型、產生並驗證完整 commit message，將訊息輸出到 stdout，但不建立 commit，也不改變真實 index。沒有 staged 內容時，會使用隔離的暫存 index 模擬 `git add -A`。
-
-範例：
-
-```text
-目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。
-
-納入 AI 完整 diff 分析的檔案（2）：
-  M "src/app.py"
-  A "tests/test_app.py"
-
-預估模型呼叫：1 次 final。
-模型呼叫次數：1
-
-feat(app): 新增使用者設定驗證
-```
-
-檔案清單、模型資訊與進度輸出到 stderr，commit message 輸出到 stdout，方便導向其他指令而不被診斷資訊污染。
-
-## 納入與排除 AI 分析的內容
-
-一般文字程式碼、測試及文件會提供完整 diff。以下只提供路徑、Git 狀態與排除原因：
-
-- 刪除檔案。
-- 已知 lockfile 或檔名以 `.lock` 結尾的檔案。
-- Minified JavaScript／CSS 類檔案。
-- Git 判定的二進位檔案。
-
-模型執行或估算前會分組列出：
-
-```text
-納入 AI 完整 diff 分析的檔案（3）：
-  M "src/app.py"
-  A "src/config.py"
-  M "tests/test_app.py"
-
-排除完整內容、只提供狀態與路徑的檔案（2）：
-  M "package-lock.json"（lockfile）
-  D "src/legacy.py"（刪除檔案）
-```
-
-每組最多顯示 100 筆，超出時會列出省略數量。
-
-## 小型與大型 diff 的模型流程
-
-工具內部的單次 prompt 上限為 48,000 UTF-8 bytes。這只限制模型輸入；建議的本機 `max_tokens: 1024` 則限制每一次 map、reduce 或 final 的輸出，兩者互不取代。
-
-可直接放入 final 時只呼叫一次：
-
-```text
-Git diff → final → commit message
-```
-
-內容過大時：
-
-```text
-Git diff
-    ↓
-多個 map chunks
-    ↓
-各 chunk 產生摘要
-    ↓
-必要時進行 reduce
-    ↓
-final commit message
-```
-
-最低呼叫次數是 `map chunk 數 + 1 次 final`：
-
-|處理計畫|最低模型呼叫數|
-|---|---|
-|直接 final|1|
-|2 map + final|3|
-|4 map + final|5|
-|7 map + final|8|
-|11 map + final|12|
-
-如果 map 摘要合併後仍過大，還會增加 reduce 呼叫，所以估算顯示的是「至少」呼叫次數。每次本機 map、reduce 與 final 都會使用相同的 `git-ac` model ID。
-
-## 本機與 Codex 的選擇
-
-|考量|`git ac` 本機|`git ac -c` Codex|
-|---|---|---|
-|隱私|diff 留在本機|完整分析 diff 會送至 Codex|
-|速度|大型異動可能較慢|大型異動通常較快|
-|Codex 額度|不使用|會使用 request／額度|
-|模型|預設 `mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac`|預設 `gpt-5.3-codex-spark`|
-|Thinking|git 專用 profile 關閉|由 Codex 模型管理|
-|建議單次輸出上限|1,024 tokens|由 Codex CLI／模型管理|
-|呼叫次數上限|不設 request 上限|預設最多 12 次|
-|代理工具|不適用|關閉 shell、網路搜尋、子代理、apps、plugins、hooks、瀏覽器、Computer Use 與圖片生成|
-
-不論規模，只要內容敏感或不能離開本機就不要使用 `-c`。
-
-## 環境變數
-
-|環境變數|預設值|用途|
-|---|---|---|
-|`DEFAULT_GIT_AC_LOCAL_MODEL`|`omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac`|覆寫單次本機 `aitext` model ID|
-|`GIT_AC_CODEX_MODEL`|`gpt-5.3-codex-spark`|覆寫單次 Codex model|
-|`GIT_AC_CODEX_MAX_CALLS`|`12`|設定單次 Codex 執行最多模型呼叫數；必須是正整數|
-|`GIT_AC_MODEL_TIMEOUT`|`120`|每一次模型呼叫的 timeout 秒數；必須是正整數|
-|`GIT_AC_TRACE_FILE`|未設定|寫入權限為 `0600` 的 JSONL 驗收 trace|
-|`GIT_AC_TRACE_CASE`|空字串|替 trace event 加入案例名稱|
-
-空白的 model 環境變數會直接報錯，不會退回其他模型。
-
-使用範例：
-
-```sh
-DEFAULT_GIT_AC_LOCAL_MODEL=omlx:custom-model git ac -p
-GIT_AC_CODEX_MODEL=gpt-5.6-luna git ac -c
-GIT_AC_CODEX_MAX_CALLS=20 git ac -c
-GIT_AC_MODEL_TIMEOUT=300 git ac
-```
-
-timeout 套用於每一次模型呼叫，不是整次命令總時間。提高 Codex request 上限也不是固定 token 或金額保證；超大型異動通常應優先拆分。
-
-### Codex 呼叫上限
-
-`git ac -c` 預設最多呼叫 Codex 12 次。大型 diff 會在第一個 request 前計算 map chunks 與 final 的最低呼叫數；超過上限會直接中止，不消耗模型 request，staged snapshot 保持不變。
-
-12 次在摘要可直接進入 final 的一般情況下，約可容納 11 個 map chunks，也就是約 500 KB 文字 diff；實際大小受檔案邊界、UTF-8 bytes 與摘要長度影響。執行中若 recursive reduce 使呼叫數達到上限，也會停止並保留 staged 內容。
-
-確認要處理更大 diff 時才提高：
-
-```sh
-GIT_AC_CODEX_MAX_CALLS=20 git ac -c
-```
-
-## 本機 aichat／aitext／oMLX 設定
-
-### 三個元件的責任
-
-- [oMLX](https://github.com/jundot/omlx) 載入 Apple Silicon 上的本機模型，並提供 `http://localhost:8000/v1` OpenAI-compatible API。
-- [`aichat`](https://github.com/sigoden/aichat) 讀取 client／model 設定，把 `git-ac` 的 prompt 傳給 oMLX，並串流回傳模型輸出。
-- `aitext` 是本專案放在 `src/aitext` 的 Bash wrapper。它把參數與 stdin 原樣交給 `aichat`、移除串流中的 `<think>...</think>`、避免無輸入時意外進入 REPL、保留 `aichat` exit code，並把輸出結尾正規化為單一換行。它不保存 API endpoint、模型或憑證。
-
-`git ac` 固定執行以下命令，因此不會改變平常直接使用 `aichat` 或 `aitext` 時的預設模型：
-
-```sh
-aitext -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
-```
-
-### 1. 準備 oMLX 與 git-ac profile
-
-依 [oMLX 官方安裝說明](https://github.com/jundot/omlx#install) 安裝 macOS App，或使用 Homebrew：
-
-```sh
-brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
-brew services start omlx
-```
-
-在 oMLX 下載 `mlx-community/gemma-4-26B-A4B-it-qat-4bit`，確認 API 位於 `http://localhost:8000/v1`，並建立 `git-ac` profile：
-
-|設定|建議值|
-|---|---|
-|模型類型|自動偵測|
-|Reasoning Parser|`None`|
-|CTX WINDOW|131,072|
-|最大 TOKEN 數|1,024|
-|溫度|0|
-|TOP P／TOP K／MIN P|0.95／64／0|
-|重複懲罰／Presence Penalty|1／0|
-|啟用思考|關閉|
-|思考 Token 限制|關閉|
-|Guided Grammar|關閉|
-|限制工具回傳 Token 數|關閉；`git ac` 不使用 tool calls|
-|強制取樣|關閉|
-
-profile 名稱本身不會自動關閉 thinking 或套用取樣參數，以上數值仍須在 oMLX 儲存。temperature 為 0 時，top-p、top-k 與 min-p 的影響有限，可維持模型原值。
-
-TTL 只控制模型閒置多久後卸載，不限制單次推論。沿用全域 1,800 秒可減少短時間重複載入；若希望更快釋放模型記憶體，可在 `git-ac` profile 改為 60～300 秒。
-
-### 2. 安裝並設定 aichat
-
-依 [`aichat` 官方說明](https://github.com/sigoden/aichat#install) 安裝；macOS 可使用：
-
-```sh
-brew install aichat
-aichat --version
-```
-
-用以下命令確認實際設定檔位置；macOS 預設是 `~/Library/Application Support/aichat/config.yaml`：
-
-```sh
-aichat --info | rg 'config_file'
-```
-
-將以下 `omlx` client 合併到既有 `config.yaml` 的 `clients` 清單，不要覆寫其他 client 或個人設定。若 oMLX 啟用了 API key，另依 `aichat` 官方機密管理方式設定，不要把 key 寫進本 repository。
-
-```yaml
-clients:
-  - type: openai-compatible
-    name: omlx
-    api_base: http://localhost:8000/v1
-    models:
-      - name: mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
-        max_input_tokens: 131072
-        max_output_tokens: 1024
-    patch:
-      chat_completions:
-        '^mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac$':
-          body:
-            max_tokens: 1024
-            temperature: 0
-```
-
-設定意義：
-
-- `max_input_tokens: 131072` 記錄模型 context 能力；`git ac` 每次 prompt 另受 48,000 UTF-8 bytes 限制。
-- `max_output_tokens: 1024` 供 `aichat` 記錄模型輸出能力及計算 context。
-- `patch...body.max_tokens: 1024` 才會真正加入 OpenAI-compatible request。
-- `temperature: 0` 降低 commit message 與 chunk 摘要的隨機性。
-
-在已驗收的 `aichat 0.30.0` 中，只設定 `max_output_tokens` 不會自行傳送 `max_tokens`。oMLX log 應顯示：
-
-```text
-max_tokens=1024, request_max_tokens=1024
-```
-
-先直接驗證 `aichat` 能連到 profile；這一步會執行一次本機推論：
-
-```sh
-printf '只輸出：本機模型設定成功\n' | \
-  aichat -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
-```
-
-### 3. 安裝 aitext wrapper
-
-`aichat` 驗證成功後，在本 repository 根目錄執行獨立設定腳本：
-
-```sh
-./scripts/setup-aitext.sh install
-exec zsh
-./scripts/setup-aitext.sh check
-```
-
-腳本會確認 macOS、`aichat`、Bash 與 Perl 可用，將 `src/aitext` 安裝成 `$HOME/bin/aitext`，並共用 `setup-git-ac.sh` 的 `~/.zshrc` PATH 管理區塊。它不會修改 `aichat` config、oMLX profile 或模型檔案。
-
-|參數|行為|
-|---|---|
-|`install`|首次安裝 wrapper 並補上 PATH 管理區塊；預設動作|
-|`update`|以 repository 的 `src/aitext` 明確更新既有 `$HOME/bin/aitext`|
-|`check`|檢查依賴、來源一致性、PATH 區塊與 `aitext --version`|
-|`help`、`-h`、`--help`|顯示設定腳本說明|
-
-若 `$HOME/bin/aitext` 已存在且內容不同，`install` 會在修改 `.zshrc` 前中止，不會覆寫；先自行備份或確認該檔案可移除。日後 repository 更新 wrapper 時執行：
+若新版同時修改了 `aitext` wrapper，且你使用 aichat backend，再執行：
 
 ```sh
 ./scripts/setup-aitext.sh update
 ./scripts/setup-aitext.sh check
 ```
 
-### 4. 驗證完整本機路徑
+## 設計原則
 
-第一個命令會經過 `aitext` → `aichat` → oMLX；接著在有 staged 測試變更的 Git repository 執行預覽，驗證 `git-ac` 整合。兩者都會執行本機推論：
+- 預設 backend 是 `aichat`。`git-ac` 經內部 `aitext` wrapper 呼叫使用者既有的 aichat 設定；資料送往本機 oMLX 或遠端服務，取決於 aichat 的 client／endpoint。
+- 也可明確選擇官方 Codex CLI 或 Claude Code CLI。backend 失敗時中止，不自動切換。
+- 尊重使用者決定的 staged 邊界；沒有 staged 內容時，正式執行才會在所有 backend preflight 成功後執行 `git add -A`。
+- 小型 diff 直接產生訊息，大型 diff 自動進行 recursive map-reduce；最終結果仍須通過格式、語言及 staged snapshot 驗證。
+
+## Backend 與預設 model
+
+|Backend|執行路徑|未設定 model 時|
+|---|---|---|
+|`aichat`|`git-ac` → `aitext` → `aichat`|`aitext` 不傳 `-m`，沿用 aichat 自己的預設 model|
+|`codex`|`git-ac` → `codex exec`|`gpt-5.6-luna`|
+|`claude`|`git-ac` → `claude --print`|`haiku` alias|
+
+`aitext` 是內部 I/O wrapper，不是 backend。oMLX 是可由 aichat 使用的 client／endpoint，也不是 backend。
+
+[GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) 與 Claude Code 的 [`haiku` alias](https://code.claude.com/docs/en/model-config) 是成本敏感的內建 fallback；正式發行前仍須通過專案的 ground-truth commit message 評測。實際 Codex CLI／Claude Code 額度與費用由帳戶方案及官方服務決定，本專案不宣稱固定單次金額。
+
+## 前置條件
+
+- macOS、zsh、Git。
+- Python 3.11 以上；執行期不需要第三方 Python 套件。
+- Git commit 身分已設定。
+- 使用 `aichat` 時需安裝並設定 `aichat`，以及本專案的 `aitext` wrapper。
+- 使用 `codex` 時需安裝官方 Codex CLI 並完成登入。
+- 使用 `claude` 時需安裝官方 Claude Code CLI 並完成登入。
+- 只有開發與測試需要 `uv`。
 
 ```sh
-printf '只輸出：aitext 設定成功\n' | \
-  aitext -m omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
-git ac -p
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
 ```
 
-完成一次本機呼叫後可檢查：
+## 安裝與更新
+
+在 repository 根目錄執行：
 
 ```sh
-rg 'Chat completion:' ~/.omlx/logs/server.log | tail -1
+./scripts/setup-git-ac.sh install
+source ~/.zshrc
+./scripts/setup-git-ac.sh check
+git ac -h
 ```
 
-若看到 `request_max_tokens=None`，代表 request patch 尚未套用；此時 oMLX 仍會使用 model profile 的 Max Tokens。
+安裝腳本會將 `src/git_ac.py` 安裝為 `$HOME/bin/git-ac`、管理 `.zshrc` 的 PATH 區塊，並設定：
 
-## 失敗與安全行為
+```sh
+git config --global alias.ac '!git-ac'
+```
 
-以下情況會中止 commit：
+安裝或更新 `aitext` wrapper：
 
-- 模型逾時、失敗或回傳空內容。
-- commit message 不符合允許的 Conventional Commits 格式。
-- Codex 呼叫達到上限。
-- 模型處理期間 staged snapshot 被其他程序改變。
-- `git commit` 執行失敗。
+```sh
+./scripts/setup-aitext.sh install
+./scripts/setup-aitext.sh check
+```
 
-大部分失敗情況不會建立 commit，staged 內容會保留，終端會顯示可重試指令。
+更新已安裝版本：
 
-### Snapshot 保護
+```sh
+git pull --ff-only
+./scripts/setup-git-ac.sh update
+./scripts/setup-git-ac.sh check
+```
 
-正式 commit 模式會在模型呼叫前後比較 staged tree，避免分析內容與實際提交內容不一致。
+腳本不會靜默覆寫既有且不同的 `alias.ac`。
 
-### 暫存 index 隔離
-
-無 staged 的 `-p`／`-e` 使用暫存 `GIT_INDEX_FILE`、暫存 `GIT_OBJECT_DIRECTORY`，並以原 repository object database 作為唯讀 alternate，因此不會改變真實 index，也不會在專案 object database 留下暫存 blob 或 tree。
-
-### Codex 啟動防護
-
-Codex 後端使用權限為 `0700` 的隔離暫存 repository。每次 request 都固定帶入以下設定，不讀取使用者 Codex 設定或 execpolicy rules：
+## CLI
 
 ```text
---strict-config
---ignore-rules
---ephemeral
---ignore-user-config
---sandbox read-only
--c 'approval_policy="never"'
--c 'web_search="disabled"'
---disable shell_tool
---disable shell_snapshot
---disable multi_agent
---disable apps
---disable plugins
---disable hooks
---disable browser_use
---disable computer_use
---disable image_generation
+git ac [--backend aichat|codex|claude] [--model MODEL]
+       [-c | --claude]
+       [-t [TYPE]] [-m MESSAGE]
+       [-p] [-e|--estimate]
+
+git ac config show
+git ac config check
+git ac config get backend
+git ac config get model BACKEND
+git ac config set backend BACKEND
+git ac config set model BACKEND MODEL
+git ac config unset backend
+git ac config unset model BACKEND
 ```
 
-- `--strict-config` 讓不支援的設定直接失敗，避免升級後靜默忽略安全參數。
-- `--ignore-user-config` 與 `--ignore-rules` 避免個人設定、MCP、plugin 或 execpolicy 改變非互動執行。
-- `--sandbox read-only` 禁止模型產生的命令寫入檔案或啟用命令網路存取。
-- `approval_policy="never"` 不允許流程等待或取得額外核准。
-- `web_search="disabled"` 與各項 `--disable` 移除和產生 commit message 無關的代理能力。
+|參數|用途|
+|---|---|
+|`--backend BACKEND`|只覆寫本次執行的 backend|
+|`-c`|相容捷徑，等同 `--backend codex`|
+|`--claude`|等同 `--backend claude`|
+|`--model MODEL`|只覆寫本次 backend 的 model|
+|`-t TYPE`、`--type TYPE`|指定 Conventional Commit type|
+|`-t`、`--type`|從 `/dev/tty` 顯示 type 選單並選擇|
+|`-m MESSAGE`、`--message MESSAGE`|提供 AI 產生訊息時的參考資訊|
+|`-p`|只預覽 commit message，不建立 commit|
+|`-e`、`--estimate`|估算 diff 規模、分塊與最低模型呼叫數，不呼叫模型|
 
-這是針對已驗證 Codex CLI flags 的 denylist，不是協定層 `tools=[]` 的形式化保證。升級 Codex CLI 後應重新執行整合測試，確認沒有 `command_execution`、`file_change`、`mcp_tool_call` 或 `web_search` event。
-
-以上防護不會讓資料留在本機：完整分析 diff 仍會送至 Codex。敏感內容仍應使用本機 `git ac`。
-
-### Commit message 暫存檔與 trace
-
-commit message 暫存檔權限為 `0600`，使用完會刪除。
-
-設定 `GIT_AC_TRACE_FILE` 後，工具會寫入權限為 `0600` 的 JSONL 驗收紀錄。紀錄只包含 backend、model、stage、prompt/output byte 數、`FACT_` 驗收標記、耗時與成功狀態，不包含 prompt、diff 或完整模型輸出。
-
-## 操作範例
-
-### 全部異動的小型修正
+多個 backend selector 不能同時使用。`-e` 只與 `-p` 互斥，因此可搭配 backend、model、type 與 message：
 
 ```sh
-git ac -e
-git ac
+git ac -e --backend claude --model sonnet -t feat \
+  -m "這次要統一 backend 設定介面"
 ```
 
-### 全部異動的中大型功能
+`config` 指令可在 Git repository 外執行。`config get` 只輸出經環境變數、TOML 與內建 fallback 解析後的單一有效值，適合 shell script 使用；`config show` 則同時顯示來源與資料去向。`config check` 不呼叫模型，只檢查選定 backend 的 CLI、model ID 與可離線確認的必要設定；帳戶是否實際獲准使用某個 Codex／Claude model，仍會在正式呼叫時由官方 CLI 判定。
+
+## 設定檔
+
+設定檔位置：
+
+```text
+~/Library/Application Support/git-ac/config.toml
+```
+
+最小設定：
+
+```toml
+version = 1
+default_backend = "aichat"
+```
+
+Model 覆寫都是選填：
+
+```toml
+version = 1
+default_backend = "aichat"
+
+[models]
+aichat = "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac"
+codex = "gpt-5.6-terra"
+claude = "sonnet"
+```
+
+設定檔以 `0600` 權限原子寫入；程式會拒絕 symlink、未知 schema version、未知欄位與無效 backend／model。設定中不保存 endpoint、憑證或其他祕密，也不支援 repository-level 設定。
+
+### 解析優先序
+
+Backend：
+
+1. CLI `--backend`、`-c`、`--claude`
+2. `GIT_AC_BACKEND`
+3. TOML `default_backend`
+4. `aichat`
+
+Model：
+
+1. CLI `--model`
+2. `GIT_AC_<BACKEND>_MODEL`
+3. TOML `[models].<backend>`
+4. backend fallback
+
+支援的環境變數：
+
+```text
+GIT_AC_BACKEND
+GIT_AC_AICHAT_MODEL
+GIT_AC_CODEX_MODEL
+GIT_AC_CLAUDE_MODEL
+GIT_AC_CODEX_MAX_CALLS
+GIT_AC_CLAUDE_MAX_CALLS
+GIT_AC_MODEL_TIMEOUT
+GIT_AC_TRACE_FILE
+GIT_AC_TRACE_CASE
+```
+
+既有 `DEFAULT_GIT_AC_LOCAL_MODEL` 仍作為 `GIT_AC_AICHAT_MODEL` 的低優先序相容 fallback。
+
+`GIT_AC_MODEL_TIMEOUT` 預設為每次呼叫 120 秒，必須是正整數。`GIT_AC_TRACE_FILE` 可指定權限為 `0600` 的 JSONL 評測 trace；`GIT_AC_TRACE_CASE` 可附加案例名稱。Trace 只包含 backend、model、stage、byte 數、`FACT_` 標記、耗時與成功狀態，不包含 prompt、diff、`--message` 原文或完整模型輸出。
+
+常用設定操作：
 
 ```sh
-git ac -e
-git ac -c
+git ac config show
+git ac config check
+git ac config get backend
+git ac config get model aichat
+git ac config set backend codex
+git ac config set model codex gpt-5.6-terra
+git ac config unset model aichat
+git ac config unset backend
 ```
 
-### 先預覽再決定
+`config show` 會顯示實際解析值及來源。aichat 未覆寫 model 時，也會查詢 aichat 的有效預設：
+
+```text
+backend：aichat（built-in）
+model：omlx:...（aichat default）
+資料去向：由 aichat client／endpoint 設定決定
+```
+
+## aichat 設定
+
+git-ac 不修改 aichat YAML。請依 [AIChat Command Line Guide](https://github.com/sigoden/aichat/wiki/Command-Line-Guide) 在 aichat 中自行管理 client、endpoint、憑證、model metadata、`max_tokens`、temperature 與 request patch。
+
+沒有 model override 時：
+
+```text
+git-ac → aitext → aichat 預設 model → 使用者設定的 client
+```
+
+此時 `aitext` 不傳 `-m`。若目前 aichat 的 top-level `model` 指向 oMLX，git-ac 就會沿用該 oMLX model。
+
+有 model override 時：
+
+```text
+git-ac → aitext -m <完整 aichat model ID> → aichat client
+```
+
+git-ac 會先用 `aichat --list-models` 驗證完整 ID；沒有 override 時則用 `aichat --info` 確認預設 model 有效。
+
+例如 aichat 設定可包含：
+
+```yaml
+model: omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac
+```
+
+實際 client 與 model 定義仍以使用者的 aichat 設定為準。執行：
+
+```sh
+aichat --info
+aichat --list-models
+```
+
+確認設定後，再執行：
+
+```sh
+git ac config check
+git ac -p
+```
+
+## Codex backend
+
+未覆寫時使用 `gpt-5.6-luna`。git-ac 會在隔離的暫存 repository 中，以唯讀 sandbox、停用工具及忽略使用者 Codex 設定的方式呼叫 `codex exec`，預設最多 12 次模型呼叫。
+
+執行前會明確提示 staged diff 與 `--message` 參考資訊將傳送至 OpenAI。認證仍由官方 Codex CLI 的全域狀態提供。
+
+```sh
+git ac -c -p
+git ac --backend codex --model gpt-5.6-terra
+```
+
+## Claude backend
+
+未覆寫時使用 `haiku` alias。git-ac 會在隔離的暫存 repository 中使用 `claude --print`，並停用工具、session persistence、一般 settings sources、非空 MCP、slash commands、Chrome、auto memory 與 prompt history，預設最多 12 次模型呼叫。[Claude Code settings](https://code.claude.com/docs/en/settings) 所述的 managed policy 與認證等必要全域狀態仍可能載入。
+
+執行前會明確提示 staged diff 與 `--message` 參考資訊將傳送至 Claude Code。
+
+```sh
+git ac --claude -p
+git ac --backend claude --model sonnet
+```
+
+## Type 選擇
+
+可用 type：
+
+|Type|選擇原則|
+|---|---|
+|`feat`|新增或擴充功能|
+|`fix`|修正錯誤行為|
+|`docs`|只有文件變更|
+|`style`|只有格式或空白，不代表 UI 樣式功能|
+|`refactor`|不改外部行為的結構調整|
+|`perf`|改善效能|
+|`test`|只有測試變更|
+|`build`|建置、依賴或封裝|
+|`ci`|CI/CD 設定|
+|`chore`|無法歸入其他類型的一般維護|
+|`revert`|回復既有變更|
+
+```sh
+git ac -t fix
+git ac --type feat
+git ac --type
+```
+
+指定 type 後，若模型回傳不同 type，git-ac 會只替換標題 type，保留 scope、`!`、description、body 與 footer，再執行完整驗證。未指定時，prompt 會依整個 commit 的主要目的判斷；配套測試或文件不主導 type，breaking change 則依 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) 獨立判斷。
+
+## 參考訊息
+
+`--message` 是給 AI 的參考資訊，不是完整 commit message：
+
+```sh
+git ac -m "這次是為了解決設定難以攜帶，issue #123"
+```
+
+- 必須是非空文字，最多 4,096 UTF-8 bytes，且每次只能提供一次。
+- 適合描述目的、術語、issue 編號及設計理由。
+- 程式行為、測試結果與相容性聲明仍須由 diff 支持。
+- 內容會加入 map、reduce 與 final prompt並納入 budget。
+- 不保存於 TOML、trace 或錯誤輸出；重試訊息也不回顯原文。
+
+## Commit message 格式
+
+```text
+<type>[optional scope][!]: <繁體中文描述>
+```
+
+- `type` 與技術性 `scope` 可保留英文；description 與一般 body 必須包含繁體中文。
+- body 為選用，與標題間需有一個空白行。
+- breaking change 可用標題的 `!`、`BREAKING CHANGE: <繁體中文說明>` footer，或兩者同時使用。
+- 支援 `Refs:`、`Closes:`、`Fixes:` 與 `Relates-to:` 等 footer。
+- code fence、模型前言、重複標題、空訊息、未允許 type 或沒有 diff 證據的聲明都會被拒絕。
+
+## Staging、preview 與 estimate
+
+|執行前狀態|正式執行|`-p`／`-e`|
+|---|---|---|
+|已有 staged 變更|只分析及提交既有 staged snapshot|只分析既有 staged snapshot|
+|沒有 staged，working tree 有異動|所有 backend preflight 成功後執行 `git add -A`|用隔離 index 模擬 `git add -A`，真實 index 不變|
+|同時有 staged 與 unstaged／untracked|只處理 staged 內容|只處理 staged 內容|
+
+`-p` 會呼叫模型但不建立 commit；`-e` 不呼叫模型，也不要求 backend CLI 已安裝。正式執行與 preview 都會在模型呼叫後再次確認 snapshot 未變。
 
 ```sh
 git ac -e
 git ac -p
-```
-
-如果預覽結果可以接受，再執行 `git ac`。這會重新呼叫模型並產生正式訊息。
-
-### 敏感的大型異動
-
-```sh
-git ac -e
-GIT_AC_MODEL_TIMEOUT=300 git ac
-```
-
-### 只處理特定模組
-
-```sh
-git add src/auth tests/auth
-git ac -e
+git ac --claude -p
 git ac -c
 ```
 
-其餘 unstaged／untracked 不會被加入。
+## 大型 diff 與呼叫上限
 
-### 多個獨立目的分開 commit
+大型 diff 會依檔案、hunk 與行切塊，先 map，再 recursive reduce，最後生成 commit message。任何 backend 都不會因總 bytes 超過固定值而直接拒絕，但會受到 prompt budget 及呼叫上限保護。
 
-```sh
-git add src/auth tests/auth
-git ac -e
-git ac -c
+Codex 與 Claude 預設各最多 12 次呼叫，可用對應環境變數調整。若估算已超過上限，指令會在呼叫模型前失敗；執行中達到上限也會立即停止，不會切換 backend。
 
-git add src/billing tests/billing
-git ac -e
-git ac -c
-```
+## 安全邊界
+
+- 不解析、追蹤或恢復 ignored 檔案內容。
+- binary diff 只保留 metadata，不將 binary payload 傳給模型。
+- Lockfile 與刪除檔案只提供狀態及路徑，避免展開大量產生內容或已刪除內容。
+- Cloud backend 會先顯示資料去向；aichat 的資料去向由其 client／endpoint 決定。
+- Backend preflight 在可能的 `git add -A` 之前完成。
+- Backend 失敗不自動 fallback，並保留 staged snapshot。
+- 設定檔不保存祕密，`--message` 不寫入 trace。
+- AI 只產生文字，不能操作 repository 或呼叫工具。
 
 ## 開發與測試
 
-同步依賴：
-
-```sh
-uv sync
-```
-
-所有測試 repository、暫存檔與輸出都必須放在 `.test-workspace/`。完整離線測試使用 fake `aitext`／`codex`，不連線或消耗模型額度：
-
 ```sh
 mkdir -p .test-workspace/tmp .test-workspace/uv-cache
 TMPDIR="$PWD/.test-workspace/tmp" \
-  UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
-  uv run python -m unittest discover -s tests -v
+UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
+uv run python -m unittest discover -s tests -v
 ```
 
-手動測試也不得直接操作本專案的 index 或 commit；請在 `.test-workspace` 建立隔離 repository：
+離線測試使用 fake `aitext`、`aichat`、`codex` 與 `claude`，不會呼叫真實模型。
+
+取得明確授權後，可分別執行小型真實 preview smoke test：
 
 ```sh
-repo_root="$PWD"
-manual_repo="$repo_root/.test-workspace/manual"
-mkdir -p "$manual_repo"
-git -C "$manual_repo" init
-git -C "$manual_repo" config user.name "git-ac test"
-git -C "$manual_repo" config user.email "git-ac-test@example.invalid"
-printf 'example\n' > "$manual_repo/example.txt"
-
-cd "$manual_repo"
-python3 "$repo_root/src/git_ac.py" -e
-```
-
-真實本機小型預覽驗收只有在明確需要時才啟用：
-
-```sh
-mkdir -p .test-workspace/tmp .test-workspace/uv-cache
+GIT_AC_RUN_AICHAT_INTEGRATION=1 \
 TMPDIR="$PWD/.test-workspace/tmp" \
-  UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
-  GIT_AC_RUN_LOCAL_INTEGRATION=1 \
-  uv run python -m unittest tests.test_real_integration -v
+UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
+uv run python -m unittest \
+  tests.test_real_integration.RealAichatBackendTests.test_real_aitext_small_preview -v
+
+GIT_AC_RUN_CODEX_INTEGRATION=1 \
+TMPDIR="$PWD/.test-workspace/tmp" \
+UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
+uv run python -m unittest \
+  tests.test_real_integration.RealCodexBackendTests.test_real_codex_small_preview -v
 ```
 
-真實大型測試的輸出也必須指定在 `.test-workspace`：
+兩者都使用隔離的 `.test-workspace/` repository 與 `-p`，驗證真實模型輸出、Conventional Commit 格式、staged snapshot 不變及沒有建立 commit。Codex 測試明確指定 `gpt-5.6-luna`。
+
+真實模型整合測試是 opt-in；只有在明確允許外部呼叫與額度消耗時執行。Luna 與 Haiku 必須在固定 ground-truth 案例中通過小型、混合型、大型 map/reduce、breaking change、必要事實及 hallucination 門檻，才可視為可發行預設。
+
+明確同意使用 Codex／Claude 額度後，可執行共同 release gate：
 
 ```sh
 TMPDIR="$PWD/.test-workspace/tmp" \
-  UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
-  uv run python tests/run_real_codex_compare.py \
-  --target-kb 180 \
-  --output .test-workspace/codex-compare.json
-
-TMPDIR="$PWD/.test-workspace/tmp" \
-  UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
-  uv run python tests/run_real_local_large.py \
-  --target-kb 150 \
-  --output .test-workspace/local-large.json
+UV_CACHE_DIR="$PWD/.test-workspace/uv-cache" \
+uv run python tests/run_real_backend_eval.py \
+  --output .test-workspace/backend-eval.json
 ```
 
-### 發行驗收政策
-
-1. 每次共用流程變更先通過完整離線單元、fake 後端、150 KB 單檔與 1 MB 多檔案例；所有大型案例都必須保持 staged snapshot 並只建立一個 commit。
-2. 發行本機後端前，另以真實 `aitext` → `aichat` → oMLX 驗證小型 preview／commit、大型多層彙整及排除內容；fake `aitext` 只能證明 orchestration，不能取代這一層。
-3. 發行 Codex 後端前，以合成資料驗證真實 `codex exec`、呼叫上限、隔離參數與單一 commit；日常離線測試不得消耗 Codex 額度。
-4. 變更 Codex 預設模型前，使用至少 20 個具 ground truth 的案例，每個模型各執行 3 次。硬性門檻為格式通過率 100%、breaking change 判定 100%、必要事實涵蓋率至少 95%、虛構事實 0，且所有大型案例只建立一個 commit。
-5. 模型選擇是版本化的整體決策，不依單一 diff 臨時切換。候選模型只有在通過所有硬性門檻，且必要事實涵蓋率和對照模型差距不超過 2 個百分點時，才可成為預設。
-
-真實後端具有非決定性，驗收應記錄日期、模型 slug、CLI／`aichat` 版本、案例、耗時與結果，不以單一參考句做完全相等比較。
-
-每次修改 `src/git_ac.py`、`src/aitext` 或設定腳本都必須檢查本 README；只要參數、環境變數、輸出、前置需求、staging 邊界、安裝／更新、錯誤行為或使用流程有變動，就要在同一個變更中同步更新。README 是唯一的使用者文件，不另建 `docs/` 或獨立 usage guide。
-
-## 已完成的驗收參考
-
-以下是 2026-07-22 的既有案例，適合作為回歸參考，不是固定效能保證：
-
-|案例|結果|
-|---|---|
-|本機 oMLX 小型 preview|成功產生合法訊息，沒有建立 commit，staged tree 未變|
-|Codex Spark commit|成功建立且只建立一個 commit，commit tree、index tree 與執行前 staged tree 一致|
-|本機 154,892-byte staged diff|4 map + 1 final，約 100.3 秒，最大 prompt 47,345 bytes，staged snapshot 未變|
-|Codex Spark 185,258-byte staged diff|4 map + 1 final，約 34.3 秒，必要標記範圍保留完整|
-|Codex Luna 相同大型案例|4 map + 1 final，約 41.1 秒，訊息合法但 final 過度壓縮|
-|超過 1 MB 離線案例|在 48,000-byte production budget 下通過至少兩層 recursive reduce|
-
-Spark／Luna 大型比較當時每個模型只有一個案例，不能取代多案例、多次重跑的正式品質評測；日常仍以當次 `git ac -e` 結果與資料敏感性為準。
+可用 `--backend codex` 或 `--backend claude` 只評測單一 backend，並以 `--codex-model`、`--claude-model` 覆寫候選 model。程式只在所有案例的 type、格式、事實保留、breaking change、虛構內容與 snapshot 檢查都通過時回傳成功。

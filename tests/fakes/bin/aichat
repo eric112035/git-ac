@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Offline fake for aichat metadata commands used by git-ac preflight."""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+args = sys.argv[1:]
+if args == ["--list-models"]:
+    models = os.environ.get(
+        "GIT_AC_FAKE_AICHAT_MODELS",
+        "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac,omlx:custom-local-model",
+    )
+    for model in models.split(","):
+        if model.strip():
+            print(model.strip())
+    raise SystemExit(0)
+if args == ["--info"]:
+    model = os.environ.get(
+        "GIT_AC_FAKE_AICHAT_DEFAULT_MODEL",
+        "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac",
+    )
+    print(f"model               {model}")
+    print("config_file         /fake/aichat/config.yaml")
+    raise SystemExit(0)
+raise SystemExit(2)

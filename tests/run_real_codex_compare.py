@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PROJECT_ROOT / "src" / "git_ac.py"
 TEST_WORKSPACE = PROJECT_ROOT / ".test-workspace"
 FACT_RE = re.compile(r"\bFACT_[A-Za-z0-9_]+\b")
-DEFAULT_MODELS = ("gpt-5.3-codex-spark", "gpt-5.6-luna")
+DEFAULT_MODELS = ("gpt-5.6-luna",)
 
 
 def run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Offline fake for the Claude Code print-mode contract."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+
+
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+stage_match = re.search(r"^TASK: (MAP|REDUCE|FINAL)$", prompt, re.MULTILINE)
+stage = stage_match.group(1).lower() if stage_match else "unknown"
+log_path = os.environ.get("GIT_AC_FAKE_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "backend": "claude",
+                    "stage": stage,
+                    "stdin_bytes": len(prompt.encode("utf-8")),
+                    "args": args,
+                    "disable_auto_memory": os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
+                    "skip_prompt_history": os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY"),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+mode = os.environ.get("GIT_AC_FAKE_MODE", "success")
+if mode == "timeout":
+    time.sleep(30)
+if mode == "fail":
+    print("usage limit exceeded", file=sys.stderr)
+    raise SystemExit(29)
+if mode == "empty":
+    raise SystemExit(0)
+
+facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
+if stage in {"map", "reduce"}:
+    suffix = "、".join(facts) if facts else "無語意標記"
+    print(f"摘要：保留來源、狀態與必要事實 {suffix}")
+elif os.environ.get("GIT_AC_FAKE_OUTPUT") is not None:
+    print(os.environ["GIT_AC_FAKE_OUTPUT"])
+elif os.environ.get("GIT_AC_FAKE_FINAL_FROM_FACTS") == "1":
+    suffix = "、".join(facts) if facts else "無"
+    print(f"feat: 更新大型資料處理\n\n保留語意標記：{suffix}")
+else:
+    print("docs(claude): 更新提交訊息產生說明")

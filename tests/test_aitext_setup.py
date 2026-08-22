@@ -52,8 +52,10 @@ exit "${FAKE_AICHAT_EXIT:-0}"
         )
 
     def test_install_is_idempotent_and_check_succeeds(self) -> None:
+        first_install = self.run_script("install")
         self.run_script("install")
-        self.run_script("install")
+
+        self.assertIn("source ~/.zshrc（或 exec zsh）", first_install.stdout)
 
         target = self.home / "bin" / "aitext"
         self.assertTrue(os.access(target, os.X_OK))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a large staged diff through real aitext/oMLX and emit safe metrics."""
+"""Run a large staged diff through the real aichat backend and emit safe metrics."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     TEST_WORKSPACE.mkdir(exist_ok=True)
-    case_dir = Path(tempfile.mkdtemp(prefix="real-local-large-", dir=TEST_WORKSPACE))
+    case_dir = Path(tempfile.mkdtemp(prefix="real-aichat-large-", dir=TEST_WORKSPACE))
     repo = case_dir / "repo"
     repo.mkdir()
     try:
@@ -61,7 +61,7 @@ def main() -> int:
             {
                 "GIT_AC_MODEL_TIMEOUT": "600",
                 "GIT_AC_TRACE_FILE": str(trace_path),
-                "GIT_AC_TRACE_CASE": "real-local-large",
+                "GIT_AC_TRACE_CASE": "real-aichat-large",
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )

@@ -22,6 +22,8 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.case_dir = Path(tempfile.mkdtemp(prefix=f"{self._testMethodName}-", dir=TEST_WORKSPACE))
         self.repo = self.case_dir / "repo"
         self.repo.mkdir()
+        self.home = self.case_dir / "home"
+        self.home.mkdir()
         self.git("init", "-q")
         self.git("config", "--local", "user.name", "git-ac test")
         self.git("config", "--local", "user.email", "git-ac-test@example.invalid")
@@ -42,11 +44,27 @@ class GitAcIntegrationTests(unittest.TestCase):
             check=check,
         )
 
-    def run_cli(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    def run_cli(
+        self,
+        *args: str,
+        extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        for name in (
+            "GIT_AC_BACKEND",
+            "GIT_AC_AICHAT_MODEL",
+            "GIT_AC_CODEX_MODEL",
+            "GIT_AC_CLAUDE_MODEL",
+            "GIT_AC_CODEX_MAX_CALLS",
+            "GIT_AC_CLAUDE_MAX_CALLS",
+            "DEFAULT_GIT_AC_LOCAL_MODEL",
+        ):
+            env.pop(name, None)
         env.update(
             {
                 "PATH": str(FAKE_BIN) + os.pathsep + env.get("PATH", ""),
+                "HOME": str(self.home),
                 "GIT_AC_FAKE_LOG": str(self.log_path),
                 "GIT_AC_MODEL_TIMEOUT": "3",
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -56,7 +74,7 @@ class GitAcIntegrationTests(unittest.TestCase):
             env.update(extra_env)
         return subprocess.run(
             [sys.executable, str(SCRIPT), *args],
-            cwd=self.repo,
+            cwd=cwd or self.repo,
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -85,36 +103,178 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(self.commit_count(), 1)
         self.assertEqual(self.git("log", "-1", "--pretty=%B").stdout.strip(), "feat(core): 新增 staged 變更處理")
         calls = self.model_calls()
-        self.assertEqual([(call["backend"], call["stage"]) for call in calls], [("aitext", "final")])
-        self.assertEqual(
-            calls[0]["args"],
-            [
-                "-m",
-                "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac",
-            ],
-        )
+        self.assertEqual([(call["backend"], call["stage"]) for call in calls], [("aichat", "final")])
+        self.assertEqual(calls[0]["args"], [])
         self.assertIn("納入 AI 完整 diff 分析的檔案（1）", result.stderr)
         self.assertIn('A "app.txt"', result.stderr)
         self.assertIn(
-            "aitext 模型：omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac",
+            "model：omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac（aichat default）",
             result.stderr,
         )
+        self.assertIn("backend：aichat（built-in）", result.stderr)
         self.assertIn("模型呼叫次數：1", result.stderr)
 
-    def test_local_model_environment_override_is_forwarded_only_to_aitext(self) -> None:
+    def test_aichat_model_environment_override_is_forwarded_to_aitext(self) -> None:
         (self.repo / "override.txt").write_text("覆寫模型\n", encoding="utf-8")
         self.git("add", "--", "override.txt")
 
         result = self.run_cli(
             "-p",
-            extra_env={"DEFAULT_GIT_AC_LOCAL_MODEL": "omlx:custom-local-model"},
+            extra_env={"GIT_AC_AICHAT_MODEL": "omlx:custom-local-model"},
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.model_calls()
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["args"], ["-m", "omlx:custom-local-model"])
-        self.assertIn("aitext 模型：omlx:custom-local-model", result.stderr)
+        self.assertIn("model：omlx:custom-local-model（GIT_AC_AICHAT_MODEL）", result.stderr)
+
+    def test_cli_type_is_forced_and_message_is_not_echoed(self) -> None:
+        (self.repo / "guided.txt").write_text("參考內容\n", encoding="utf-8")
+        self.git("add", "--", "guided.txt")
+        guidance = "對應內部 issue SECRET-42"
+
+        result = self.run_cli("-p", "--type", "fix", "--message", guidance)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("fix(core):"), result.stdout)
+        self.assertNotIn(guidance, result.stdout)
+        self.assertNotIn(guidance, result.stderr)
+        calls = self.model_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0]["stdin_bytes"], 0)
+
+    def test_message_may_only_be_provided_once(self) -> None:
+        (self.repo / "guided.txt").write_text("參考內容\n", encoding="utf-8")
+        self.git("add", "--", "guided.txt")
+
+        result = self.run_cli("-p", "-m", "第一則", "--message", "第二則")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("只能指定一次", result.stderr)
+        self.assertNotIn("第一則", result.stderr)
+        self.assertNotIn("第二則", result.stderr)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_type_without_value_fails_safely_without_tty(self) -> None:
+        (self.repo / "type.txt").write_text("類型\n", encoding="utf-8")
+        self.git("add", "--", "type.txt")
+
+        result = self.run_cli("-p", "--type")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("目前沒有可用 TTY", result.stderr)
+        self.assertIn("feat：新增或擴充功能", result.stderr)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_config_commands_work_outside_repository_and_control_defaults(self) -> None:
+        result = self.run_cli("config", "set", "backend", "claude", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config_path = self.home / "Library" / "Application Support" / "git-ac" / "config.toml"
+        self.assertTrue(config_path.exists())
+        self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+        result = self.run_cli("config", "show", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backend：claude（config.toml）", result.stdout)
+        self.assertIn("model：haiku（built-in）", result.stdout)
+        result = self.run_cli("config", "get", "backend", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "claude\n")
+        result = self.run_cli("config", "get", "model", "claude", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "haiku\n")
+
+        (self.repo / "configured.txt").write_text("設定預設\n", encoding="utf-8")
+        self.git("add", "--", "configured.txt")
+        result = self.run_cli("-p")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.model_calls()[0]["backend"], "claude")
+
+        result = self.run_cli(
+            "config",
+            "set",
+            "model",
+            "claude",
+            "sonnet",
+            cwd=self.case_dir,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_cli("config", "get", "model", "claude", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "sonnet\n")
+        result = self.run_cli("config", "check", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backend=claude，model=sonnet", result.stdout)
+        self.assertEqual(len(self.model_calls()), 1)
+
+        result = self.run_cli(
+            "config",
+            "unset",
+            "model",
+            "claude",
+            cwd=self.case_dir,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("model：haiku（built-in）", result.stdout)
+        result = self.run_cli("config", "unset", "backend", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backend：aichat（built-in）", result.stdout)
+        result = self.run_cli("config", "get", "model", "aichat", cwd=self.case_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac\n",
+        )
+
+    def test_config_get_uses_environment_precedence(self) -> None:
+        result = self.run_cli(
+            "config",
+            "get",
+            "backend",
+            cwd=self.case_dir,
+            extra_env={"GIT_AC_BACKEND": "codex"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "codex\n")
+        result = self.run_cli(
+            "config",
+            "get",
+            "model",
+            "codex",
+            cwd=self.case_dir,
+            extra_env={"GIT_AC_CODEX_MODEL": "gpt-env"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "gpt-env\n")
+
+    def test_config_set_aichat_model_requires_aichat_model_list(self) -> None:
+        result = self.run_cli(
+            "config",
+            "set",
+            "model",
+            "aichat",
+            "omlx:not-configured",
+            cwd=self.case_dir,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("aichat 尚未設定 model", result.stderr)
+
+    def test_aichat_preflight_failure_does_not_stage_worktree(self) -> None:
+        (self.repo / "untracked.txt").write_text("不得被 staging\n", encoding="utf-8")
+
+        result = self.run_cli("--model", "omlx:not-configured")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("aichat 尚未設定 model", result.stderr)
+        self.assertEqual(self.git("status", "--short").stdout, "?? untracked.txt\n")
+        self.assertEqual(self.model_calls(), [])
+
+    def test_backend_selectors_are_mutually_exclusive(self) -> None:
+        result = self.run_cli("-c", "--claude", "-p")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not allowed with argument", result.stderr)
+        self.assertEqual(self.model_calls(), [])
 
     def test_codex_preview_is_isolated_disables_tools_and_keeps_index(self) -> None:
         (self.repo / "cloud.txt").write_text("雲端模式\n", encoding="utf-8")
@@ -141,7 +301,7 @@ class GitAcIntegrationTests(unittest.TestCase):
             "read-only",
             "-C",
             "--model",
-            "gpt-5.3-codex-spark",
+            "gpt-5.6-luna",
             "--output-last-message",
         ):
             self.assertIn(expected, argv)
@@ -173,7 +333,7 @@ class GitAcIntegrationTests(unittest.TestCase):
                 "image_generation",
             ],
         )
-        self.assertNotIn("aitext", [call["backend"] for call in calls])
+        self.assertNotIn("aichat", [call["backend"] for call in calls])
 
     def test_codex_preview_without_stage_uses_temporary_index(self) -> None:
         (self.repo / "cloud-untracked.txt").write_text("雲端預覽\n", encoding="utf-8")
@@ -189,6 +349,48 @@ class GitAcIntegrationTests(unittest.TestCase):
         calls = self.model_calls()
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["backend"], "codex")
+
+    def test_claude_preview_uses_haiku_and_disables_external_capabilities(self) -> None:
+        (self.repo / "claude.txt").write_text("Claude 預覽\n", encoding="utf-8")
+        self.git("add", "--", "claude.txt")
+
+        result = self.run_cli("--claude", "-p")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docs(claude): 更新提交訊息產生說明", result.stdout)
+        calls = self.model_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["backend"], "claude")
+        argv = calls[0]["args"]
+        for expected in (
+            "--print",
+            "--model",
+            "haiku",
+            "--no-session-persistence",
+            "--tools",
+            "--disable-slash-commands",
+            "--setting-sources",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{}",
+        ):
+            self.assertIn(expected, argv)
+        self.assertEqual(calls[0]["disable_auto_memory"], "1")
+        self.assertEqual(calls[0]["skip_prompt_history"], "1")
+        self.assertIn("資料去向：完整分析 diff 與使用者參考資訊會傳送至 Claude Code", result.stderr)
+
+    def test_claude_failure_preserves_snapshot_without_backend_fallback(self) -> None:
+        (self.repo / "claude-failure.txt").write_text("保留 staged 內容\n", encoding="utf-8")
+        self.git("add", "--", "claude-failure.txt")
+        before = self.git("write-tree").stdout.strip()
+
+        result = self.run_cli("--claude", "-p", extra_env={"GIT_AC_FAKE_MODE": "fail"})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("用量或速率限制不足", result.stderr)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
+        calls = self.model_calls()
+        self.assertEqual([call["backend"] for call in calls], ["claude"])
 
     def test_preview_without_stage_uses_temporary_index(self) -> None:
         (self.repo / "unstaged.txt").write_text("尚未加入\n", encoding="utf-8")
@@ -259,7 +461,9 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertIn("處理方式：直接 final", result.stdout)
         self.assertIn("預估模型呼叫：至少 1 次", result.stdout)
         self.assertIn("規模判定：小型", result.stdout)
-        self.assertIn("建議使用本機 git ac", result.stdout)
+        self.assertIn("Backend：aichat（built-in）", result.stdout)
+        self.assertIn("Model：aichat default（aichat default）", result.stdout)
+        self.assertIn("可使用目前選定的 aichat backend", result.stdout)
         self.assertIn('A "app.py"', result.stdout)
         self.assertIn('A "package-lock.json"（lockfile）', result.stdout)
         self.assertEqual(self.git("write-tree").stdout.strip(), before)
@@ -272,24 +476,30 @@ class GitAcIntegrationTests(unittest.TestCase):
         (self.repo / "large.py").write_text(content, encoding="utf-8")
         self.git("add", "-A")
 
-        result = self.run_cli("--estimate", extra_env={"GIT_AC_CODEX_MAX_CALLS": "1"})
+        result = self.run_cli(
+            "--estimate",
+            "-c",
+            extra_env={"GIT_AC_CODEX_MAX_CALLS": "1"},
+        )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"處理方式：\d+ 個 map chunks \+ 1 次 final")
         self.assertRegex(result.stdout, r"預估模型呼叫：至少 [2-9]\d* 次")
-        self.assertIn("Codex 上限：超過目前 1 次上限", result.stdout)
+        self.assertIn("codex 上限：超過目前 1 次上限", result.stdout)
         self.assertIn("規模判定：超大型", result.stdout)
         self.assertEqual(self.model_calls(), [])
 
-    def test_estimate_rejects_preview_or_codex_combination(self) -> None:
+    def test_estimate_rejects_preview_but_accepts_backend_selection(self) -> None:
         (self.repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
         self.git("add", "-A")
 
-        for arguments in (("-e", "-p"), ("-e", "-c")):
-            with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("不可與 -c 或 -p 同時使用", result.stderr)
+        result = self.run_cli("-e", "-p")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不可與 -p 同時使用", result.stderr)
+
+        result = self.run_cli("-e", "-c")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Backend：codex（CLI）", result.stdout)
         self.assertEqual(self.model_calls(), [])
 
     def test_no_staged_content_auto_stages_all_changes(self) -> None:
@@ -412,6 +622,26 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(self.model_calls(), [])
         self.assertEqual(self.git("write-tree").stdout.strip(), before)
         self.assertEqual(self.commit_count(), 0)
+
+    def test_claude_call_cap_aborts_before_first_model_request(self) -> None:
+        content = "FACT_CLAUDE_CAP\n" + (
+            "需要分塊的大型內容 abcdefghijklmnopqrstuvwxyz\n" * 2_000
+        )
+        (self.repo / "claude-too-large.txt").write_text(content, encoding="utf-8")
+        self.git("add", "-A")
+        before = self.git("write-tree").stdout.strip()
+
+        result = self.run_cli(
+            "--claude",
+            "-p",
+            extra_env={"GIT_AC_CLAUDE_MAX_CALLS": "1"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("超過上限 1 次", result.stderr)
+        self.assertIn("尚未送出任何模型 request", result.stderr)
+        self.assertEqual(self.model_calls(), [])
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
 
 
 if __name__ == "__main__":
