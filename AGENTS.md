@@ -13,11 +13,16 @@
 ## 指令與文件同步
 
 - `src/git_ac.py` 是 `git ac` 的實作來源。
-- 每次修改 `src/git_ac.py` 都必須檢查 `README.md`；只要參數、環境變數、輸出、前置需求、staging 邊界、安裝／更新方式、錯誤行為或使用流程有任何使用者可觀察的變動，必須在同一個變更中同步更新 `README.md`。
-- `README.md` 是唯一的使用者文件，必須持續涵蓋前置設定、安裝與更新、所有指令參數、環境變數、指令行為、限制、安全邊界、錯誤處理及可直接執行的範例。
-- 不建立 `docs/` 或獨立的 `git-ac-usage-guide`；需要長期保留的操作或驗收資訊直接整理到 `README.md`。
-- `scripts/setup-git-ac.sh` 必須與 `src/git_ac.py` 的檔名、安裝位置及 Git alias 保持一致。變更安裝流程時同步更新腳本、README 與相關測試。
-- `scripts/setup-aitext.sh` 必須與 `src/aitext` 的行為、安裝位置及 `aichat` 前置需求保持一致；變更 wrapper 或本機後端設定時同步更新腳本、README 與相關測試。
+- `README.md` 是專案入口文件，必須持續涵蓋專案定位、前置需求、快速安裝與更新、最短可執行範例、重要安全邊界及完整 Wiki 連結。
+- `../git-ac-wiki` 是附屬 GitHub Wiki 的本機 repository，作為完整使用者與開發者文件；必須涵蓋所有指令參數、環境變數、安裝與更新、指令行為、限制、安全邊界、錯誤處理、疑難排解、架構及可直接執行的範例。
+- 每次修改 `src/git_ac.py` 都必須檢查 `README.md` 與 `../git-ac-wiki` 的相關頁面；只要參數、環境變數、輸出、前置需求、staging 邊界、安裝／更新方式、錯誤行為或使用流程有任何使用者可觀察的變動，必須在同一個工作內同步更新兩邊的相關內容。
+- 架構、backend 整合、開發流程或維護方式有實質變更時，即使不影響一般使用者操作，也必須檢查並更新 Wiki 的相關架構或開發文件。
+- 純內部重構、格式調整，或只調整測試且不改變既有行為時，不要求修改使用者文件。
+- 不在此 repository 建立 `docs/` 或獨立的 `git-ac-usage-guide`；不適合放在入口 README 的長篇操作、驗收、架構或疑難排解資訊整理到 `../git-ac-wiki`。
+- `scripts/setup-git-ac.sh` 必須與 `src/git_ac.py` 的檔名、安裝位置及 Git alias 保持一致。變更安裝流程時同步更新腳本、README、Wiki 相關頁面與相關測試。
+- `scripts/setup-aitext.sh` 必須與 `src/aitext` 的行為、安裝位置及 `aichat` 前置需求保持一致；變更 wrapper 或本機後端設定時同步更新腳本、README、Wiki 相關頁面與相關測試。
+- 若 `../git-ac-wiki` 不存在或不在可寫入的 workspace 範圍內，必須在交付摘要列出尚未同步的文件、原因及預期頁面，不得宣稱文件同步完成。
+- `git-ac` 與 `git-ac-wiki` 是不同的 Git repository，文件同步是同一工作內的跨 repository 變更，不可能落在同一個 commit；未經使用者明確要求，不得自行 commit 或 push 任一 repository。
 
 ## 測試隔離
 
