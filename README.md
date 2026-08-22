@@ -2,7 +2,7 @@
 
 `git ac` 會分析 Git staged snapshot，產生一則繁體中文、符合 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) 的 commit message，並建立單一 commit。
 
-> **平台限制：**目前僅支援並驗證 macOS 與 zsh。Linux、Windows 及其他 shell 尚不在支援範圍。
+> **平台限制：** 目前僅支援並驗證 macOS 與 zsh。Linux、Windows 及其他 shell 尚不在支援範圍。
 
 完整的安裝、設定、CLI、安全邊界、疑難排解與開發文件請見 [git-ac Wiki](https://github.com/eric112035/git-ac/wiki)。
 
