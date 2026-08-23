@@ -31,6 +31,7 @@ DEFAULT_TIMEOUT_SECONDS = 120
 MAX_USER_MESSAGE_BYTES = 4_096
 MAX_MODEL_ID_LENGTH = 512
 MAX_REPORTED_FILES = 100
+MAX_REPAIR_VALIDATION_ERROR_BYTES = 160
 BACKEND_NAMES = frozenset({"aichat", "codex", "claude"})
 CODEX_CONFIG_OVERRIDES = (
     'approval_policy="never"',
@@ -90,6 +91,10 @@ class GitAcError(RuntimeError):
     """An expected, user-facing failure."""
 
 
+class CommitMessageValidationError(GitAcError):
+    """A model output error eligible for one same-backend repair attempt."""
+
+
 @dataclass(frozen=True)
 class FileChange:
     status: str
@@ -123,6 +128,12 @@ class MessagePlan:
     @property
     def minimum_calls(self) -> int:
         return self.map_chunks + 1
+
+
+@dataclass(frozen=True)
+class GeneratedMessage:
+    message: str
+    final_payload: str
 
 
 @dataclass(frozen=True)
@@ -630,6 +641,8 @@ def prompt_for(
     stage: str,
     payload: str,
     guidance: PromptGuidance | None = None,
+    *,
+    validation_error: str | None = None,
 ) -> str:
     options = guidance or PromptGuidance()
     common = (
@@ -650,7 +663,7 @@ def prompt_for(
             "合併重複資訊並以精簡繁體中文彙整所有摘要。不得遺漏來源、Git 狀態、breaking change 證據"
             "或 FACT_ 開頭的語意標記。只輸出彙整摘要。\n"
         )
-    elif stage == "final":
+    elif stage in {"final", "repair"}:
         allowed = " ".join(sorted(ALLOWED_TYPES))
         if options.commit_type is not None:
             type_rule = f"標題 type 必須使用使用者指定的 {options.commit_type}，不得自行改成其他 type。\n"
@@ -660,8 +673,28 @@ def prompt_for(
                 f"依整個 commit 的主要目的選擇 type：{descriptions}。"
                 "配套測試或文件不主導 type；breaking change 與 type 分開判斷。\n"
             )
+        if stage == "repair":
+            if validation_error is None:
+                raise ValueError("repair stage requires validation_error")
+            error_size = utf8_size(validation_error)
+            if error_size > MAX_REPAIR_VALIDATION_ERROR_BYTES:
+                raise GitAcError(
+                    "內部格式驗證錯誤說明過長，無法建立安全的 repair prompt。"
+                )
+            repair_context = (
+                "前次輸出格式錯誤；請只依同一份變更證據重產，不得加入證據外事實。"
+                "前次無效輸出不會提供給你。\n"
+                f"<VALIDATION_ERROR>{json.dumps(validation_error, ensure_ascii=False)}</VALIDATION_ERROR>\n"
+            )
+            task_name = "REPAIR"
+        else:
+            if validation_error is not None:
+                raise ValueError("validation_error is only valid for repair stage")
+            repair_context = ""
+            task_name = "FINAL"
         task = (
-            "TASK: FINAL\n"
+            f"TASK: {task_name}\n"
+            f"{repair_context}"
             "只輸出一則符合 Conventional Commits 1.0.0 的 commit message，不得加前言、說明或 code fence。\n"
             "標題格式：<type>[optional scope][!]: <繁體中文描述>。\n"
             f"type 只能是：{allowed}。type 與技術性 scope 可用英文；description 與 body 使用繁體中文。\n"
@@ -769,8 +802,10 @@ def build_message_plan(
 ) -> MessagePlan:
     if not units:
         raise GitAcError("沒有可分析的 staged 變更。")
+    if not final_payload_fits("", budget, guidance):
+        raise GitAcError("內部 prompt byte budget 過小，無法執行 final／repair 階段。")
     full_payload = "\n\n".join(unit.text for unit in units)
-    if utf8_size(prompt_for("final", full_payload, guidance)) <= budget:
+    if final_payload_fits(full_payload, budget, guidance):
         return MessagePlan(full_payload=full_payload, map_groups=())
 
     map_capacity = payload_capacity("map", budget, guidance)
@@ -783,14 +818,38 @@ def build_message_plan(
     )
 
 
+def final_payload_fits(
+    payload: str,
+    budget: int,
+    guidance: PromptGuidance | None = None,
+) -> bool:
+    final_size = utf8_size(prompt_for("final", payload, guidance))
+    repair_size = utf8_size(
+        prompt_for(
+            "repair",
+            payload,
+            guidance,
+            validation_error="x" * MAX_REPAIR_VALIDATION_ERROR_BYTES,
+        )
+    )
+    return max(final_size, repair_size) <= budget
+
+
 def invoke_with_budget(
     backend: Backend,
     stage: str,
     payload: str,
     budget: int,
     guidance: PromptGuidance | None = None,
+    *,
+    validation_error: str | None = None,
 ) -> str:
-    prompt = prompt_for(stage, payload, guidance)
+    prompt = prompt_for(
+        stage,
+        payload,
+        guidance,
+        validation_error=validation_error,
+    )
     size = utf8_size(prompt)
     if size > budget:
         raise GitAcError(f"{stage} prompt 超過 {budget} UTF-8 bytes（實際 {size}）。")
@@ -854,7 +913,7 @@ def trace_model_call(
         raise GitAcError("無法寫入 GIT_AC_TRACE_FILE；已中止以免產生不完整的驗收紀錄。") from exc
 
 
-def generate_message(
+def generate_message_result(
     units: Sequence[DiffUnit],
     backend: Backend,
     *,
@@ -862,16 +921,18 @@ def generate_message(
     max_calls: int | None = None,
     progress: Callable[[str], None] | None = None,
     guidance: PromptGuidance | None = None,
-) -> str:
+) -> GeneratedMessage:
     report = progress or (lambda _message: None)
     plan = build_message_plan(units, budget, guidance)
     if not plan.map_groups:
-        report("預估模型呼叫：1 次 final。")
-        return invoke_with_budget(backend, "final", plan.full_payload, budget, guidance)
+        report("預估模型呼叫：1 次 final；格式驗證失敗時最多再 1 次 repair。")
+        message = invoke_with_budget(backend, "final", plan.full_payload, budget, guidance)
+        return GeneratedMessage(message=message, final_payload=plan.full_payload)
 
     report(
         f"大型 diff 將拆成 {plan.map_chunks} 個 map chunks；"
-        f"預估至少呼叫模型 {plan.minimum_calls} 次（含 final）。"
+        f"預估至少呼叫模型 {plan.minimum_calls} 次（含 final）；"
+        "格式驗證失敗時最多再 1 次 repair。"
     )
     if max_calls is not None and plan.minimum_calls > max_calls:
         raise GitAcError(
@@ -887,8 +948,9 @@ def generate_message(
 
     for round_number in range(1, 13):
         combined = "\n\n".join(summaries)
-        if utf8_size(prompt_for("final", combined, guidance)) <= budget:
-            return invoke_with_budget(backend, "final", combined, budget, guidance)
+        if final_payload_fits(combined, budget, guidance):
+            message = invoke_with_budget(backend, "final", combined, budget, guidance)
+            return GeneratedMessage(message=message, final_payload=combined)
 
         reduce_capacity = payload_capacity("reduce", budget, guidance)
         reduce_pieces: list[str] = []
@@ -903,6 +965,25 @@ def generate_message(
             next_summaries.append(f"[REDUCE {round_number} 摘要 {index}/{len(reduce_groups)}]\n{summary}")
         summaries = next_summaries
     raise GitAcError("摘要經過 12 層彙整後仍超過 prompt byte budget；請檢查模型摘要輸出。")
+
+
+def generate_message(
+    units: Sequence[DiffUnit],
+    backend: Backend,
+    *,
+    budget: int = PROMPT_BUDGET,
+    max_calls: int | None = None,
+    progress: Callable[[str], None] | None = None,
+    guidance: PromptGuidance | None = None,
+) -> str:
+    return generate_message_result(
+        units,
+        backend,
+        budget=budget,
+        max_calls=max_calls,
+        progress=progress,
+        guidance=guidance,
+    ).message
 
 
 def normalize_user_message(message: str | None) -> str | None:
@@ -969,7 +1050,7 @@ def force_commit_type(message: str, expected_type: str) -> str:
     first_line, separator, remainder = clean.partition("\n")
     match = TITLE_RE.fullmatch(first_line)
     if not match:
-        raise GitAcError("無法在模型輸出中套用使用者指定的 commit type。")
+        raise CommitMessageValidationError("無法在模型輸出中套用使用者指定的 commit type。")
     start, end = match.span("type")
     rewritten = first_line[:start] + expected_type + first_line[end:]
     return rewritten + (separator + remainder if separator else "")
@@ -980,32 +1061,36 @@ def validate_commit_message(message: str, expected_type: str | None = None) -> s
         message = force_commit_type(message, expected_type)
     clean = message.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not clean:
-        raise GitAcError("模型回傳空的 commit message。")
+        raise CommitMessageValidationError("模型回傳空的 commit message。")
     if "\x00" in clean:
-        raise GitAcError("commit message 含有 NUL 字元。")
+        raise CommitMessageValidationError("commit message 含有 NUL 字元。")
     if "```" in clean or "~~~" in clean:
-        raise GitAcError("commit message 不得包含 code fence。")
+        raise CommitMessageValidationError("commit message 不得包含 code fence。")
 
     lines = clean.splitlines()
     match = TITLE_RE.fullmatch(lines[0])
     if not match:
-        raise GitAcError("commit message 標題不符合 Conventional Commits 格式。")
+        raise CommitMessageValidationError("commit message 標題不符合 Conventional Commits 格式。")
     if match.group("type") not in ALLOWED_TYPES:
-        raise GitAcError(f"commit message 使用未允許的 type：{match.group('type')}")
+        raise CommitMessageValidationError("commit message 使用未允許的 type。")
     if expected_type is not None and match.group("type") != expected_type:
-        raise GitAcError(f"commit message 未使用指定的 type：{expected_type}")
+        raise CommitMessageValidationError(f"commit message 未使用指定的 type：{expected_type}")
     if not CJK_RE.search(match.group("description")):
-        raise GitAcError("commit message description 必須包含繁體中文內容。")
+        raise CommitMessageValidationError("commit message description 必須包含繁體中文內容。")
     if len(lines) > 1 and lines[1] != "":
-        raise GitAcError("commit message 標題與 body/footer 之間必須保留一個空白行。")
+        raise CommitMessageValidationError(
+            "commit message 標題與 body/footer 之間必須保留一個空白行。"
+        )
     if lines[0] in lines[1:]:
-        raise GitAcError("commit message 不得重複標題。")
+        raise CommitMessageValidationError("commit message 不得重複標題。")
 
     for line in lines[2:]:
         if line.startswith("BREAKING CHANGE:"):
             detail = line.removeprefix("BREAKING CHANGE:").strip()
             if not detail or not CJK_RE.search(detail):
-                raise GitAcError("BREAKING CHANGE footer 必須包含繁體中文說明。")
+                raise CommitMessageValidationError(
+                    "BREAKING CHANGE footer 必須包含繁體中文說明。"
+                )
     prose_lines = [
         line
         for line in lines[2:]
@@ -1013,7 +1098,7 @@ def validate_commit_message(message: str, expected_type: str | None = None) -> s
         and not re.match(r"^(?:BREAKING CHANGE|Refs|Closes|Fixes|Relates-to):", line, re.IGNORECASE)
     ]
     if prose_lines and not CJK_RE.search("\n".join(prose_lines)):
-        raise GitAcError("commit message body 必須包含繁體中文內容。")
+        raise CommitMessageValidationError("commit message body 必須包含繁體中文內容。")
     return clean + "\n"
 
 
@@ -1596,6 +1681,7 @@ def report_estimate(
     else:
         emit("  處理方式：直接 final")
     emit(f"  預估模型呼叫：至少 {plan.minimum_calls} 次")
+    emit("  格式修復：首次驗證失敗時最多額外 1 次 repair")
     if max_calls is None:
         emit("  Backend 呼叫上限：未設定")
     elif plan.minimum_calls > max_calls:
@@ -1642,15 +1728,49 @@ def execute_selected_snapshot(
         progress(f"資料去向：完整分析 diff 與使用者參考資訊會傳送至 {destination}。")
 
     backend = CallBudgetBackend(raw_backend, max_calls)
-    message = generate_message(
-        units,
-        backend,
-        max_calls=max_calls,
-        progress=progress,
-        guidance=guidance,
-    )
-    progress(f"模型呼叫次數：{backend.calls_used}")
-    message = validate_commit_message(message, guidance.commit_type)
+    try:
+        generated = generate_message_result(
+            units,
+            backend,
+            max_calls=max_calls,
+            progress=progress,
+            guidance=guidance,
+        )
+        try:
+            message = validate_commit_message(generated.message, guidance.commit_type)
+        except CommitMessageValidationError as initial_error:
+            after_initial = staged_snapshot(repo, environment)
+            if after_initial != before:
+                raise GitAcError(
+                    "模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。"
+                ) from initial_error
+            progress(
+                f"模型輸出格式無效（{initial_error}）；"
+                "正以相同 backend／model 自動修復一次。"
+            )
+            try:
+                repaired = invoke_with_budget(
+                    backend,
+                    "repair",
+                    generated.final_payload,
+                    PROMPT_BUDGET,
+                    guidance,
+                    validation_error=str(initial_error),
+                )
+            except GitAcError as repair_error:
+                raise GitAcError(
+                    f"首次模型輸出格式無效（{initial_error}）；"
+                    f"自動修復未完成：{repair_error}"
+                ) from repair_error
+            try:
+                message = validate_commit_message(repaired, guidance.commit_type)
+            except CommitMessageValidationError as repaired_error:
+                raise GitAcError(
+                    f"模型自動修復後仍未通過格式驗證（首次：{initial_error}；"
+                    f"修復後：{repaired_error}）。"
+                ) from repaired_error
+    finally:
+        progress(f"模型呼叫次數：{backend.calls_used}")
     after = staged_snapshot(repo, environment)
     if after != before:
         raise GitAcError("模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。")

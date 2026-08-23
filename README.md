@@ -13,6 +13,7 @@
 - 尊重既有 staged 邊界；大型 diff 會自動分塊並以 recursive map-reduce 處理。
 - 可先 preview commit message，或只估算規模與最低模型呼叫數。
 - 驗證 Conventional Commits 格式、繁體中文內容與 staged snapshot 一致性後才 commit。
+- 首次格式驗證失敗時，會由相同 backend／model 依原始證據自動重產一次；仍不合格就安全中止。
 
 ## 前置條件
 
@@ -107,7 +108,7 @@ git ac -p
 git ac
 ```
 
-- `git ac -e`：估算規模與最低模型呼叫數，不呼叫模型。
+- `git ac -e`：估算規模、最低模型呼叫數與條件式 repair，不呼叫模型。
 - `git ac -p`：產生 preview，不建立 commit。
 - `git ac`：產生訊息並建立一個 commit。
 
@@ -136,6 +137,7 @@ git ac -p -m "修正登入逾時，對應 issue #123"
 - ignored 檔案不會被加入；binary、lockfile、minified 與刪除檔案只提供狀態及路徑，不展開完整內容。
 - 模型只能回傳文字，不能操作目標 repository 或呼叫工具。
 - 模型處理期間 staged snapshot 改變時會中止；backend 或 commit 失敗時保留 staged 內容。
+- 格式 repair 最多呼叫相同 backend／model 一次，不會把首次無效輸出交回模型或切換服務。
 - Codex／Claude 的 diff 與 `--message` 會送往對應雲端；aichat 的資料去向由使用者設定決定。
 
 詳細流程與限制請見 [Staging 與安全邊界](https://github.com/eric112035/git-ac/wiki/Staging-and-Safety)。

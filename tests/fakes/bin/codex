@@ -11,8 +11,10 @@ import time
 
 args = sys.argv[1:]
 prompt = sys.stdin.read()
-stage_match = re.search(r"^TASK: (MAP|REDUCE|FINAL)$", prompt, re.MULTILINE)
+stage_match = re.search(r"^TASK: (MAP|REDUCE|FINAL|REPAIR)$", prompt, re.MULTILINE)
 stage = stage_match.group(1).lower() if stage_match else "unknown"
+facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
+forbidden_prompt_text = os.environ.get("GIT_AC_FAKE_FORBIDDEN_PROMPT_TEXT")
 log_path = os.environ.get("GIT_AC_FAKE_LOG")
 if log_path:
     with open(log_path, "a", encoding="utf-8") as handle:
@@ -23,13 +25,17 @@ if log_path:
                     "stage": stage,
                     "stdin_bytes": len(prompt.encode("utf-8")),
                     "args": args,
+                    "input_fact_markers": facts,
+                    "contains_forbidden_prompt_text": bool(
+                        forbidden_prompt_text and forbidden_prompt_text in prompt
+                    ),
                 },
                 ensure_ascii=False,
             )
             + "\n"
         )
 
-mode = os.environ.get("GIT_AC_FAKE_MODE", "success")
+mode = os.environ.get(f"GIT_AC_FAKE_{stage.upper()}_MODE", os.environ.get("GIT_AC_FAKE_MODE", "success"))
 if mode == "timeout":
     time.sleep(30)
 if mode == "fail":
@@ -42,10 +48,13 @@ except (ValueError, IndexError):
 
 if mode == "empty":
     output = ""
+elif stage == "final" and os.environ.get("GIT_AC_FAKE_FINAL_OUTPUT") is not None:
+    output = os.environ["GIT_AC_FAKE_FINAL_OUTPUT"]
+elif stage == "repair" and os.environ.get("GIT_AC_FAKE_REPAIR_OUTPUT") is not None:
+    output = os.environ["GIT_AC_FAKE_REPAIR_OUTPUT"]
 elif os.environ.get("GIT_AC_FAKE_OUTPUT") is not None:
     output = os.environ["GIT_AC_FAKE_OUTPUT"]
 else:
-    facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
     if stage in {"map", "reduce"}:
         suffix = "、".join(facts) if facts else "無語意標記"
         output = f"摘要：保留來源、狀態與必要事實 {suffix}"

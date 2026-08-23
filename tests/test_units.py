@@ -30,6 +30,7 @@ from git_ac import (  # noqa: E402
     diff_line_counts,
     force_commit_type,
     generate_message,
+    generate_message_result,
     load_user_config,
     normalize_user_message,
     parse_name_status_z,
@@ -120,16 +121,33 @@ class ByteChunkTests(unittest.TestCase):
         result = generate_message(
             units,
             backend,
-            budget=1_800,
+            budget=2_400,
             guidance=PromptGuidance(message="大型變更評測參考資訊"),
         )
         stages = [stage for stage, _prompt in backend.calls]
         self.assertIn("map", stages)
         self.assertIn("reduce", stages)
         self.assertEqual(stages[-1], "final")
-        self.assertTrue(all(utf8_size(prompt) <= 1_800 for _stage, prompt in backend.calls))
+        self.assertTrue(all(utf8_size(prompt) <= 2_400 for _stage, prompt in backend.calls))
         self.assertIn("FACT_ALPHA", result)
         self.assertIn("FACT_BETA", result)
+
+    def test_final_payload_also_fits_reserved_repair_prompt(self) -> None:
+        backend = RecordingBackend()
+        budget = 1_800
+        generated = generate_message_result(
+            [DiffUnit("large.txt", "FACT_ALPHA\n" + ("內容內容內容\n" * 800))],
+            backend,
+            budget=budget,
+        )
+
+        repair_prompt = prompt_for(
+            "repair",
+            generated.final_payload,
+            validation_error="commit message 標題不符合 Conventional Commits 格式。",
+        )
+
+        self.assertLessEqual(utf8_size(repair_prompt), budget)
 
     def test_codex_preflight_rejects_excessive_map_calls_before_invocation(self) -> None:
         backend = RecordingBackend()
@@ -230,6 +248,21 @@ class PromptGuidanceTests(unittest.TestCase):
     def test_explicit_type_is_a_hard_prompt_rule(self) -> None:
         prompt = prompt_for("final", "diff", PromptGuidance(commit_type="docs"))
         self.assertIn("標題 type 必須使用使用者指定的 docs", prompt)
+
+    def test_repair_prompt_reuses_evidence_and_validation_error(self) -> None:
+        prompt = prompt_for(
+            "repair",
+            "FACT_REPAIR_EVIDENCE\n原始變更證據",
+            PromptGuidance(commit_type="docs", message="維持原始目的"),
+            validation_error="commit message 不得包含 code fence。",
+        )
+
+        self.assertIn("TASK: REPAIR", prompt)
+        self.assertIn("FACT_REPAIR_EVIDENCE", prompt)
+        self.assertIn("commit message 不得包含 code fence。", prompt)
+        self.assertIn("標題 type 必須使用使用者指定的 docs", prompt)
+        self.assertIn("維持原始目的", prompt)
+        self.assertIn("前次無效輸出不會提供給你", prompt)
 
     def test_message_and_type_input_validation(self) -> None:
         self.assertEqual(normalize_user_message("  補充目的  "), "補充目的")

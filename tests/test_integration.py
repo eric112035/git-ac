@@ -59,6 +59,12 @@ class GitAcIntegrationTests(unittest.TestCase):
             "GIT_AC_CODEX_MAX_CALLS",
             "GIT_AC_CLAUDE_MAX_CALLS",
             "DEFAULT_GIT_AC_LOCAL_MODEL",
+            "GIT_AC_FAKE_FINAL_OUTPUT",
+            "GIT_AC_FAKE_REPAIR_OUTPUT",
+            "GIT_AC_FAKE_FINAL_MODE",
+            "GIT_AC_FAKE_REPAIR_MODE",
+            "GIT_AC_FAKE_FORBIDDEN_PROMPT_TEXT",
+            "GIT_AC_FAKE_MUTATE_STAGE",
         ):
             env.pop(name, None)
         env.update(
@@ -460,6 +466,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertIn("完整分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
         self.assertIn("處理方式：直接 final", result.stdout)
         self.assertIn("預估模型呼叫：至少 1 次", result.stdout)
+        self.assertIn("格式修復：首次驗證失敗時最多額外 1 次 repair", result.stdout)
         self.assertIn("規模判定：小型", result.stdout)
         self.assertIn("Backend：aichat（built-in）", result.stdout)
         self.assertIn("Model：aichat default（aichat default）", result.stdout)
@@ -485,6 +492,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"處理方式：\d+ 個 map chunks \+ 1 次 final")
         self.assertRegex(result.stdout, r"預估模型呼叫：至少 [2-9]\d* 次")
+        self.assertIn("格式修復：首次驗證失敗時最多額外 1 次 repair", result.stdout)
         self.assertIn("codex 上限：超過目前 1 次上限", result.stdout)
         self.assertIn("規模判定：超大型", result.stdout)
         self.assertEqual(self.model_calls(), [])
@@ -557,17 +565,133 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertIn("排除完整內容、只提供狀態與路徑的檔案（1）", result.stderr)
         self.assertIn('A "package-lock.json"（lockfile）', result.stderr)
 
-    def test_invalid_model_output_preserves_staged_snapshot(self) -> None:
+    def test_invalid_final_is_repaired_once_for_every_backend(self) -> None:
+        (self.repo / "repair.txt").write_text("FACT_REPAIR_EVIDENCE\n需要提交\n", encoding="utf-8")
+        self.git("add", "--", "repair.txt")
+        invalid_output = "FORBIDDEN_FIRST_OUTPUT_TOKEN"
+
+        for backend, backend_args in (
+            ("aichat", ()),
+            ("codex", ("-c",)),
+            ("claude", ("--claude",)),
+        ):
+            with self.subTest(backend=backend):
+                call_offset = len(self.model_calls())
+                result = self.run_cli(
+                    *backend_args,
+                    "-p",
+                    extra_env={
+                        "GIT_AC_FAKE_FINAL_OUTPUT": invalid_output,
+                        "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 自動修復提交訊息",
+                        "GIT_AC_FAKE_FORBIDDEN_PROMPT_TEXT": invalid_output,
+                    },
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "fix: 自動修復提交訊息\n")
+                calls = self.model_calls()[call_offset:]
+                self.assertEqual(
+                    [(call["backend"], call["stage"]) for call in calls],
+                    [(backend, "final"), (backend, "repair")],
+                )
+                self.assertIn("FACT_REPAIR_EVIDENCE", calls[1]["input_fact_markers"])
+                self.assertFalse(calls[1]["contains_forbidden_prompt_text"])
+                self.assertIn("正以相同 backend／model 自動修復一次", result.stderr)
+                self.assertIn("模型呼叫次數：2", result.stderr)
+                self.assertEqual(self.commit_count(), 0)
+
+    def test_repaired_message_creates_exactly_one_commit(self) -> None:
+        (self.repo / "repair-commit.txt").write_text("需要提交\n", encoding="utf-8")
+        self.git("add", "--", "repair-commit.txt")
+
+        result = self.run_cli(
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "以下是 commit message：",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "docs: 新增修復流程文件",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commit_count(), 1)
+        self.assertEqual(
+            self.git("log", "-1", "--pretty=%B").stdout.strip(),
+            "docs: 新增修復流程文件",
+        )
+        self.assertEqual(
+            [call["stage"] for call in self.model_calls()],
+            ["final", "repair"],
+        )
+
+    def test_invalid_repair_output_preserves_staged_snapshot(self) -> None:
         (self.repo / "invalid.txt").write_text("保留我\n", encoding="utf-8")
         self.git("add", "--", "invalid.txt")
         before = self.git("write-tree").stdout.strip()
 
-        result = self.run_cli("-p", extra_env={"GIT_AC_FAKE_OUTPUT": "Here is your commit message"})
+        result = self.run_cli(
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "Here is your commit message",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "Still not a commit message",
+            },
+        )
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("自動修復後仍未通過格式驗證", result.stderr)
+        self.assertIn("模型呼叫次數：2", result.stderr)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final", "repair"])
         self.assertEqual(self.commit_count(), 0)
         self.assertEqual(self.git("write-tree").stdout.strip(), before)
         self.assertNotEqual(self.git("diff", "--cached", "--quiet", check=False).returncode, 0)
+
+    def test_repair_backend_failure_reports_initial_validation_error(self) -> None:
+        (self.repo / "repair-failure.txt").write_text("保留 staged 內容\n", encoding="utf-8")
+        self.git("add", "--", "repair-failure.txt")
+        before = self.git("write-tree").stdout.strip()
+
+        result = self.run_cli(
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_MODE": "fail",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("首次模型輸出格式無效", result.stderr)
+        self.assertIn("自動修復未完成", result.stderr)
+        self.assertIn("aichat 在 repair 階段失敗", result.stderr)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final", "repair"])
+
+    def test_repair_timeout_preserves_staged_snapshot(self) -> None:
+        (self.repo / "repair-timeout.txt").write_text("保留 staged 內容\n", encoding="utf-8")
+        self.git("add", "--", "repair-timeout.txt")
+        before = self.git("write-tree").stdout.strip()
+
+        result = self.run_cli(
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_MODE": "timeout",
+                "GIT_AC_MODEL_TIMEOUT": "1",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("首次模型輸出格式無效", result.stderr)
+        self.assertIn("aichat 在 repair 階段逾時", result.stderr)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final", "repair"])
+
+    def test_empty_final_output_does_not_trigger_repair(self) -> None:
+        (self.repo / "empty.txt").write_text("保留 staged 內容\n", encoding="utf-8")
+        self.git("add", "--", "empty.txt")
+
+        result = self.run_cli("-p", extra_env={"GIT_AC_FAKE_FINAL_MODE": "empty"})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("final 階段回傳空輸出", result.stderr)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final"])
 
     def test_index_change_during_model_call_aborts(self) -> None:
         path = self.repo / "race.txt"
@@ -576,13 +700,40 @@ class GitAcIntegrationTests(unittest.TestCase):
 
         result = self.run_cli(
             "-p",
-            extra_env={"GIT_AC_FAKE_MUTATE_FILE": str(path), "GIT_AC_FAKE_REPO": str(self.repo)},
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 不應執行修復",
+                "GIT_AC_FAKE_MUTATE_FILE": str(path),
+                "GIT_AC_FAKE_REPO": str(self.repo),
+            },
         )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("staged snapshot 已改變", result.stderr)
         self.assertEqual(self.commit_count(), 0)
         self.assertEqual(self.git("show", ":race.txt").stdout, "模型執行期間變更\n")
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final"])
+
+    def test_index_change_during_repair_aborts_after_validation(self) -> None:
+        path = self.repo / "repair-race.txt"
+        path.write_text("執行前\n", encoding="utf-8")
+        self.git("add", "--", "repair-race.txt")
+
+        result = self.run_cli(
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 修正提交訊息格式",
+                "GIT_AC_FAKE_MUTATE_FILE": str(path),
+                "GIT_AC_FAKE_MUTATE_STAGE": "repair",
+                "GIT_AC_FAKE_REPO": str(self.repo),
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("staged snapshot 已改變", result.stderr)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final", "repair"])
+        self.assertEqual(self.commit_count(), 0)
 
     def test_large_diff_uses_bounded_map_reduce_prompts(self) -> None:
         facts = []
@@ -620,6 +771,29 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertIn("超過上限 1 次", result.stderr)
         self.assertIn("尚未送出任何模型 request", result.stderr)
         self.assertEqual(self.model_calls(), [])
+        self.assertEqual(self.git("write-tree").stdout.strip(), before)
+        self.assertEqual(self.commit_count(), 0)
+
+    def test_codex_repair_respects_existing_call_cap(self) -> None:
+        (self.repo / "repair-cap.txt").write_text("需要提交\n", encoding="utf-8")
+        self.git("add", "--", "repair-cap.txt")
+        before = self.git("write-tree").stdout.strip()
+
+        result = self.run_cli(
+            "-c",
+            "-p",
+            extra_env={
+                "GIT_AC_CODEX_MAX_CALLS": "1",
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 不應超過呼叫上限",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("首次模型輸出格式無效", result.stderr)
+        self.assertIn("模型呼叫已達上限 1 次", result.stderr)
+        self.assertIn("模型呼叫次數：1", result.stderr)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final"])
         self.assertEqual(self.git("write-tree").stdout.strip(), before)
         self.assertEqual(self.commit_count(), 0)
 
