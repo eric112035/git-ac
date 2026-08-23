@@ -139,6 +139,7 @@ git ac -p -m "修正登入逾時，對應 issue #123"
 - 模型處理期間 staged snapshot 改變時會中止；backend 或 commit 失敗時保留 staged 內容。
 - 格式 repair 最多呼叫相同 backend／model 一次，不會把首次無效輸出交回模型或切換服務。
 - Codex／Claude 的 diff 與 `--message` 會送往對應雲端；aichat 的資料去向由使用者設定決定。
+- Backend 收到的是 git-ac 經 stdin 傳入的 UTF-8 純文字 prompt，不是 chat `messages` JSON；其共同結構、各階段差異與實際範例請見 Wiki。
 
 詳細流程與限制請見 [Staging 與安全邊界](https://github.com/eric112035/git-ac/wiki/Staging-and-Safety)。
 
