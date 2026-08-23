@@ -65,6 +65,7 @@ class GitAcIntegrationTests(unittest.TestCase):
             "GIT_AC_FAKE_REPAIR_MODE",
             "GIT_AC_FAKE_FORBIDDEN_PROMPT_TEXT",
             "GIT_AC_FAKE_MUTATE_STAGE",
+            "GIT_AC_FAKE_MOVE_HEAD_TO",
         ):
             env.pop(name, None)
         env.update(
@@ -119,6 +120,283 @@ class GitAcIntegrationTests(unittest.TestCase):
         )
         self.assertIn("backend：aichat（built-in）", result.stderr)
         self.assertIn("模型呼叫次數：1", result.stderr)
+
+    def test_reword_short_and_long_options_preview_the_same_head_diff(self) -> None:
+        (self.repo / "reword.txt").write_text("FACT_REWORD_ALIAS\n", encoding="utf-8")
+        self.git("add", "--", "reword.txt")
+        self.git("commit", "-qm", "chore: 舊訊息")
+        before = self.git("rev-parse", "HEAD").stdout.strip()
+        guidance = "對應內部 issue SECRET-REWORD"
+
+        for option in ("-r", "--reword"):
+            with self.subTest(option=option):
+                call_offset = len(self.model_calls())
+                result = self.run_cli(option, "-p", "-t", "fix", "-m", guidance)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("fix(core):"), result.stdout)
+                self.assertIn("分析來源：HEAD", result.stderr)
+                self.assertIn("root commit，相對空 tree", result.stderr)
+                self.assertNotIn(guidance, result.stdout)
+                self.assertNotIn(guidance, result.stderr)
+                calls = self.model_calls()[call_offset:]
+                self.assertEqual(len(calls), 1)
+                self.assertIn("FACT_REWORD_ALIAS", calls[0]["input_fact_markers"])
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
+
+    def test_reword_root_commit_preserves_tree_and_has_no_parents(self) -> None:
+        (self.repo / "root.txt").write_text("FACT_REWORD_ROOT\n", encoding="utf-8")
+        self.git("add", "--", "root.txt")
+        self.git("commit", "-qm", "chore: 舊 root 訊息")
+        old_head = self.git("rev-parse", "HEAD").stdout.strip()
+        old_tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        self.assertEqual(self.git("show", "-s", "--format=%P", "HEAD").stdout.strip(), "")
+
+        result = self.run_cli(
+            "-r",
+            extra_env={"GIT_AC_FAKE_FINAL_OUTPUT": "feat: 重新說明 root commit"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.git("rev-parse", "HEAD").stdout.strip(), old_head)
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").stdout.strip(), old_tree)
+        self.assertEqual(self.git("show", "-s", "--format=%P", "HEAD").stdout.strip(), "")
+        self.assertEqual(self.commit_count(), 1)
+        self.assertIn("FACT_REWORD_ROOT", self.model_calls()[0]["input_fact_markers"])
+
+    def test_reword_changes_only_message_and_preserves_repository_content(self) -> None:
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("基準\n", encoding="utf-8")
+        self.git("add", "--", "tracked.txt")
+        self.git("commit", "-qm", "test: 建立基準")
+        tracked.write_text("FACT_REWORD_HEAD\n", encoding="utf-8")
+        self.git("add", "--", "tracked.txt")
+        self.git("commit", "-qm", "feat: 不完整的舊訊息 FACT_REWORD_OLD_MESSAGE")
+
+        old_head = self.git("rev-parse", "HEAD").stdout.strip()
+        old_tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        old_parents = self.git("show", "-s", "--format=%P", "HEAD").stdout.strip()
+        old_author = self.git(
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%aI",
+            "HEAD",
+        ).stdout
+
+        tracked.write_text("FACT_REWORD_STAGED\n", encoding="utf-8")
+        self.git("add", "--", "tracked.txt")
+        staged_tree = self.git("write-tree").stdout.strip()
+        tracked.write_text("FACT_REWORD_UNSTAGED\n", encoding="utf-8")
+        untracked = self.repo / "untracked.txt"
+        untracked.write_text("FACT_REWORD_UNTRACKED\n", encoding="utf-8")
+        status_before = self.git("status", "--short").stdout
+
+        result = self.run_cli(
+            "-r",
+            extra_env={"GIT_AC_FAKE_FINAL_OUTPUT": "fix(core): 修正提交訊息內容"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new_head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(new_head, old_head)
+        self.assertEqual(self.commit_count(), 2)
+        self.assertEqual(
+            self.git("log", "-1", "--pretty=%B").stdout.strip(),
+            "fix(core): 修正提交訊息內容",
+        )
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").stdout.strip(), old_tree)
+        self.assertEqual(
+            self.git("show", "-s", "--format=%P", "HEAD").stdout.strip(),
+            old_parents,
+        )
+        self.assertEqual(
+            self.git("show", "-s", "--format=%an%x00%ae%x00%aI", "HEAD").stdout,
+            old_author,
+        )
+        self.assertEqual(self.git("write-tree").stdout.strip(), staged_tree)
+        self.assertEqual(self.git("status", "--short").stdout, status_before)
+        self.assertEqual(
+            tracked.read_text(encoding="utf-8"),
+            "FACT_REWORD_UNSTAGED\n",
+        )
+        self.assertEqual(
+            untracked.read_text(encoding="utf-8"),
+            "FACT_REWORD_UNTRACKED\n",
+        )
+        calls = self.model_calls()
+        self.assertEqual([call["stage"] for call in calls], ["final"])
+        self.assertIn("FACT_REWORD_HEAD", calls[0]["input_fact_markers"])
+        self.assertNotIn("FACT_REWORD_OLD_MESSAGE", calls[0]["input_fact_markers"])
+        self.assertNotIn("FACT_REWORD_STAGED", calls[0]["input_fact_markers"])
+        self.assertNotIn("FACT_REWORD_UNSTAGED", calls[0]["input_fact_markers"])
+        self.assertNotIn("FACT_REWORD_UNTRACKED", calls[0]["input_fact_markers"])
+
+    def test_reword_estimate_uses_head_without_model_or_side_effects(self) -> None:
+        committed = self.repo / "committed.txt"
+        committed.write_text("FACT_REWORD_ESTIMATE\n", encoding="utf-8")
+        self.git("add", "--", "committed.txt")
+        self.git("commit", "-qm", "feat: 舊訊息")
+        (self.repo / "staged.txt").write_text("FACT_ESTIMATE_STAGED\n", encoding="utf-8")
+        self.git("add", "--", "staged.txt")
+        before_head = self.git("rev-parse", "HEAD").stdout.strip()
+        before_index = self.git("write-tree").stdout.strip()
+        before_status = self.git("status", "--short").stdout
+
+        result = self.run_cli("--reword", "-e")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("分析來源：HEAD", result.stdout)
+        self.assertIn("root commit，相對空 tree", result.stdout)
+        self.assertIn('A "committed.txt"', result.stdout)
+        self.assertNotIn("staged.txt", result.stdout)
+        self.assertEqual(self.model_calls(), [])
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before_head)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before_index)
+        self.assertEqual(self.git("status", "--short").stdout, before_status)
+
+    def test_reword_rejects_missing_head_and_empty_commit_before_model(self) -> None:
+        result = self.run_cli("-r", "-p")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("沒有可 reword 的 HEAD commit", result.stderr)
+        self.assertEqual(self.model_calls(), [])
+
+        self.git("commit", "--allow-empty", "-qm", "chore: 空 commit")
+        result = self.run_cli("-r", "-p")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HEAD commit 沒有可分析的 diff", result.stderr)
+        self.assertEqual(self.model_calls(), [])
+
+    def test_reword_merge_commit_uses_first_parent_and_keeps_both_parents(self) -> None:
+        (self.repo / "base.txt").write_text("基準\n", encoding="utf-8")
+        self.git("add", "--", "base.txt")
+        self.git("commit", "-qm", "test: 建立基準")
+        main_branch = self.git("branch", "--show-current").stdout.strip()
+        self.git("switch", "-qc", "topic")
+        (self.repo / "topic.txt").write_text("FACT_REWORD_MERGE\n", encoding="utf-8")
+        self.git("add", "--", "topic.txt")
+        self.git("commit", "-qm", "feat: 新增 topic")
+        self.git("switch", "-q", main_branch)
+        (self.repo / "main.txt").write_text("主線\n", encoding="utf-8")
+        self.git("add", "--", "main.txt")
+        self.git("commit", "-qm", "feat: 更新主線")
+        self.git("merge", "--no-ff", "-m", "feat: 合併 topic", "topic")
+        old_tree = self.git("rev-parse", "HEAD^{tree}").stdout.strip()
+        old_parents = self.git("show", "-s", "--format=%P", "HEAD").stdout.strip()
+        self.assertEqual(len(old_parents.split()), 2)
+
+        result = self.run_cli(
+            "--reword",
+            extra_env={"GIT_AC_FAKE_FINAL_OUTPUT": "feat: 重新說明合併內容"},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("相對第一個 parent", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").stdout.strip(), old_tree)
+        self.assertEqual(
+            self.git("show", "-s", "--format=%P", "HEAD").stdout.strip(),
+            old_parents,
+        )
+        self.assertIn("FACT_REWORD_MERGE", self.model_calls()[0]["input_fact_markers"])
+
+    def test_reword_repair_reuses_head_diff_without_rewriting_preview(self) -> None:
+        (self.repo / "repair-reword.txt").write_text(
+            "FACT_REWORD_REPAIR\n",
+            encoding="utf-8",
+        )
+        self.git("add", "--", "repair-reword.txt")
+        self.git("commit", "-qm", "chore: 舊訊息")
+        before = self.git("rev-parse", "HEAD").stdout.strip()
+
+        result = self.run_cli(
+            "-r",
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 修正 reword 訊息",
+            },
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "fix: 修正 reword 訊息\n")
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final", "repair"])
+        self.assertIn("FACT_REWORD_REPAIR", self.model_calls()[1]["input_fact_markers"])
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
+
+    def test_reword_repair_respects_cloud_call_cap(self) -> None:
+        (self.repo / "reword-cap.txt").write_text("FACT_REWORD_CAP\n", encoding="utf-8")
+        self.git("add", "--", "reword-cap.txt")
+        self.git("commit", "-qm", "chore: 舊訊息")
+        before = self.git("rev-parse", "HEAD").stdout.strip()
+
+        result = self.run_cli(
+            "-r",
+            "-c",
+            "-p",
+            extra_env={
+                "GIT_AC_CODEX_MAX_CALLS": "1",
+                "GIT_AC_FAKE_FINAL_OUTPUT": "invalid output",
+                "GIT_AC_FAKE_REPAIR_OUTPUT": "fix: 不應執行的 repair",
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("模型呼叫已達上限 1 次", result.stderr)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final"])
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
+
+    def test_reword_runs_commit_hooks_and_preserves_head_on_failure(self) -> None:
+        (self.repo / "hook.txt").write_text("FACT_REWORD_HOOK\n", encoding="utf-8")
+        self.git("add", "--", "hook.txt")
+        self.git("commit", "-qm", "chore: 舊訊息")
+        before_head = self.git("rev-parse", "HEAD").stdout.strip()
+        before_index = self.git("write-tree").stdout.strip()
+        hook = self.repo / ".git" / "hooks" / "commit-msg"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(0o755)
+
+        result = self.run_cli(
+            "-r",
+            extra_env={"GIT_AC_FAKE_FINAL_OUTPUT": "fix: 應被 hook 拒絕"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Git reword 階段失敗", result.stderr)
+        self.assertIn("原 HEAD 未改寫", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before_head)
+        self.assertEqual(self.git("write-tree").stdout.strip(), before_index)
+
+    def test_reword_aborts_when_head_moves_during_model_call(self) -> None:
+        path = self.repo / "head-race.txt"
+        path.write_text("基準\n", encoding="utf-8")
+        self.git("add", "--", "head-race.txt")
+        self.git("commit", "-qm", "test: 建立基準")
+        path.write_text("FACT_REWORD_RACE\n", encoding="utf-8")
+        self.git("add", "--", "head-race.txt")
+        self.git("commit", "-qm", "feat: 舊訊息")
+        parent = self.git("rev-parse", "HEAD^").stdout.strip()
+
+        result = self.run_cli(
+            "-r",
+            "-p",
+            extra_env={
+                "GIT_AC_FAKE_MOVE_HEAD_TO": parent,
+                "GIT_AC_FAKE_REPO": str(self.repo),
+            },
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HEAD 已改變", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), parent)
+        self.assertEqual([call["stage"] for call in self.model_calls()], ["final"])
+
+    def test_reword_retry_command_uses_long_option_and_redacts_guidance(self) -> None:
+        result = self.run_cli("-r", "-m", "SECRET-FIRST", "-m", "SECRET-SECOND")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("可重試：git ac --reword --message <原參考資訊>", result.stderr)
+        self.assertNotIn("SECRET-FIRST", result.stderr)
+        self.assertNotIn("SECRET-SECOND", result.stderr)
+        self.assertEqual(self.model_calls(), [])
 
     def test_aichat_model_environment_override_is_forwarded_to_aitext(self) -> None:
         (self.repo / "override.txt").write_text("覆寫模型\n", encoding="utf-8")

@@ -1,6 +1,6 @@
 # git-ac
 
-`git ac` 會分析 Git staged snapshot，產生一則繁體中文、符合 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) 的 commit message，並建立單一 commit。
+`git ac` 會分析 Git staged snapshot 或目前 `HEAD` commit 的 diff，產生一則繁體中文、符合 [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) 的 commit message，並建立單一 commit 或只改寫目前 commit 的訊息。
 
 > **平台限制：** 目前僅支援並驗證 macOS 與 zsh。Linux、Windows 及其他 shell 尚不在支援範圍。
 
@@ -12,6 +12,7 @@
 - 預設使用 `aichat`；backend 失敗時中止，不會自動切換服務。
 - 尊重既有 staged 邊界；大型 diff 會自動分塊並以 recursive map-reduce 處理。
 - 可先 preview commit message，或只估算規模與最低模型呼叫數。
+- 可從目前 `HEAD` 的 diff 重新產生並替換 commit message，不納入新的 staged／working tree 內容。
 - 驗證 Conventional Commits 格式、繁體中文內容與 staged snapshot 一致性後才 commit。
 - 首次格式驗證失敗時，會由相同 backend／model 依原始證據自動重產一次；仍不合格就安全中止。
 
@@ -120,7 +121,11 @@ git ac --claude -p
 git ac --backend aichat -p
 git ac -p -t fix
 git ac -p -m "修正登入逾時，對應 issue #123"
+git ac -r -p
+git ac -r -t fix -m "補充原 commit 的設計理由"
 ```
+
+`git ac -r` 與 `git ac --reword` 等價：兩者會分析目前 `HEAD` 相對第一個 parent 的 diff，重新產生完整訊息，再以 message-only amend 改寫該 commit。搭配 `-p` 時只預覽，搭配 `-e` 時只估算。
 
 完整參數與設定指令請見 [CLI 參考](https://github.com/eric112035/git-ac/wiki/CLI-Reference)及[設定](https://github.com/eric112035/git-ac/wiki/Configuration)。
 
@@ -132,6 +137,8 @@ git ac -p -m "修正登入逾時，對應 issue #123"
 |沒有 staged、working tree 有異動|backend preflight 成功後執行 `git add -A`|以隔離 index 模擬 `git add -A`，真實 index 不變|
 |同時有 staged 與 unstaged／untracked|只處理 staged 內容|只處理 staged 內容|
 
+`-r／--reword` 不使用以上自動 staging 規則，而是固定分析目前 `HEAD`；目前 index 與 working tree 會被忽略並保留。Root commit 相對空 tree，merge commit 相對第一個 parent。舊 commit message 不會送給模型，需保留的理由、footer 或 issue reference 應透過 `-m` 提供。
+
 重要邊界：
 
 - ignored 檔案不會被加入；binary、lockfile、minified 與刪除檔案只提供狀態及路徑，不展開完整內容。
@@ -140,6 +147,7 @@ git ac -p -m "修正登入逾時，對應 issue #123"
 - 格式 repair 最多呼叫相同 backend／model 一次，不會把首次無效輸出交回模型或切換服務。
 - Codex／Claude 的 diff 與 `--message` 會送往對應雲端；aichat 的資料去向由使用者設定決定。
 - Backend 收到的是 git-ac 經 stdin 傳入的 UTF-8 純文字 prompt，不是 chat `messages` JSON；其共同結構、各階段差異與實際範例請見 Wiki。
+- Reword 會建立新的 commit object 並改變 hash；若舊 commit 已推送，後續同步可能需要協調並改寫遠端歷史。git-ac 不會自動 push。
 
 詳細流程與限制請見 [Staging 與安全邊界](https://github.com/eric112035/git-ac/wiki/Staging-and-Safety)。
 

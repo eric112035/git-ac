@@ -54,6 +54,21 @@ if stage == mutate_stage and os.environ.get("GIT_AC_FAKE_MUTATE_FILE"):
         stderr=subprocess.DEVNULL,
     )
 
+if stage == mutate_stage and os.environ.get("GIT_AC_FAKE_MOVE_HEAD_TO"):
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            os.environ["GIT_AC_FAKE_REPO"],
+            "update-ref",
+            "HEAD",
+            os.environ["GIT_AC_FAKE_MOVE_HEAD_TO"],
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
 if stage in {"map", "reduce"}:
     suffix = "、".join(facts) if facts else "無語意標記"
     summary = f"摘要：保留來源、狀態與必要事實 {suffix}"

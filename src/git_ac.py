@@ -156,6 +156,14 @@ class PromptGuidance:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class DiffSource:
+    arguments: tuple[str, ...]
+    snapshot: str
+    kind: str
+    description: str | None = None
+
+
 class Backend(Protocol):
     name: str
 
@@ -421,6 +429,84 @@ def staged_snapshot(repo: Path, environment: Mapping[str, str] | None = None) ->
     return snapshot
 
 
+def current_head_commit(repo: Path, *, required: bool = True) -> str | None:
+    result = run_git(repo, ["rev-parse", "--verify", "HEAD^{commit}"], check=False)
+    if result.returncode != 0:
+        if required:
+            raise GitAcError("目前沒有可 reword 的 HEAD commit。")
+        return None
+    commit = result.stdout.strip()
+    if not commit:
+        if required:
+            raise GitAcError("無法解析目前 HEAD commit。")
+        return None
+    return commit
+
+
+def empty_tree_id(repo: Path) -> str:
+    result = run_git(repo, ["hash-object", "-t", "tree", "--stdin"], input_text="")
+    tree = result.stdout.strip()
+    if not tree:
+        raise GitAcError("無法解析 repository 的空 tree。")
+    return tree
+
+
+def staged_diff_source(
+    repo: Path,
+    environment: Mapping[str, str] | None = None,
+) -> DiffSource:
+    return DiffSource(
+        arguments=("--cached",),
+        snapshot=staged_snapshot(repo, environment),
+        kind="staged",
+    )
+
+
+def head_diff_source(repo: Path) -> DiffSource:
+    head = current_head_commit(repo)
+    if head is None:
+        raise GitAcError("目前沒有可 reword 的 HEAD commit。")
+    result = run_git(repo, ["rev-list", "--parents", "-n", "1", head])
+    fields = result.stdout.split()
+    if not fields or fields[0] != head:
+        raise GitAcError("無法解析目前 HEAD commit 的 parent。")
+    parents = fields[1:]
+    if parents:
+        base = parents[0]
+        relationship = "相對第一個 parent"
+    else:
+        base = empty_tree_id(repo)
+        relationship = "root commit，相對空 tree"
+    return DiffSource(
+        arguments=(base, head),
+        snapshot=head,
+        kind="head",
+        description=f"分析來源：HEAD {head[:12]}（{relationship}）",
+    )
+
+
+def diff_source_snapshot(
+    repo: Path,
+    source: DiffSource,
+    environment: Mapping[str, str] | None = None,
+) -> str | None:
+    if source.kind == "head":
+        return current_head_commit(repo, required=False)
+    return staged_snapshot(repo, environment)
+
+
+def ensure_diff_source_unchanged(
+    repo: Path,
+    source: DiffSource,
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    if diff_source_snapshot(repo, source, environment) == source.snapshot:
+        return
+    if source.kind == "head":
+        raise GitAcError("分析期間 HEAD 已改變；已中止，請檢查目前 commit 後重試。")
+    raise GitAcError("模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。")
+
+
 def parse_name_status_z(raw: bytes) -> list[FileChange]:
     fields = raw.split(b"\0")
     if fields and fields[-1] == b"":
@@ -432,20 +518,30 @@ def parse_name_status_z(raw: bytes) -> list[FileChange]:
         index += 1
         path_count = 2 if status.startswith(("R", "C")) else 1
         if index + path_count > len(fields):
-            raise GitAcError("Git name-status 輸出不完整，無法安全解析 staged 檔案。")
+            raise GitAcError("Git name-status 輸出不完整，無法安全解析變更檔案。")
         paths = tuple(os.fsdecode(item) for item in fields[index : index + path_count])
         changes.append(FileChange(status=status, paths=paths))
         index += path_count
     return changes
 
 
-def list_staged_changes(
+def list_changes(
     repo: Path,
+    source: DiffSource,
     environment: Mapping[str, str] | None = None,
 ) -> list[FileChange]:
     try:
         result = subprocess.run(
-            ["git", "diff", "--cached", "--name-status", "-z", "--find-renames", "--no-ext-diff", "--"],
+            [
+                "git",
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                "--no-ext-diff",
+                *source.arguments,
+                "--",
+            ],
             cwd=repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -455,9 +551,11 @@ def list_staged_changes(
     except FileNotFoundError as exc:
         raise GitAcError("找不到 git；請先安裝 Git 後重試。") from exc
     if result.returncode != 0:
-        raise GitAcError(f"Git staged 檔案列舉失敗（exit code {result.returncode}）。")
+        raise GitAcError(f"Git diff 檔案列舉失敗（exit code {result.returncode}）。")
     changes = parse_name_status_z(result.stdout)
     if not changes:
+        if source.kind == "head":
+            raise GitAcError("目前 HEAD commit 沒有可分析的 diff。")
         raise GitAcError("沒有可分析的 staged 變更。")
     return changes
 
@@ -476,17 +574,18 @@ def is_content_excluded(change: FileChange) -> str | None:
 def read_change_diff(
     repo: Path,
     change: FileChange,
+    source: DiffSource,
     environment: Mapping[str, str] | None = None,
 ) -> bytes:
     result = subprocess.run(
         [
             "git",
             "diff",
-            "--cached",
             "--no-color",
             "--no-ext-diff",
             "--find-renames",
             "--unified=3",
+            *source.arguments,
             "--",
             *change.paths,
         ],
@@ -497,7 +596,7 @@ def read_change_diff(
         env=environment,
     )
     if result.returncode != 0:
-        raise GitAcError(f"讀取 staged diff 失敗：{change.display_path}")
+        raise GitAcError(f"讀取 diff 失敗：{change.display_path}")
     return result.stdout
 
 
@@ -534,6 +633,7 @@ def diff_line_counts(diff: bytes) -> tuple[int, int]:
 def build_diff_units(
     repo: Path,
     changes: Sequence[FileChange],
+    source: DiffSource,
     environment: Mapping[str, str] | None = None,
 ) -> list[DiffUnit]:
     units: list[DiffUnit] = []
@@ -546,7 +646,7 @@ def build_diff_units(
             additions = 0
             deletions = 0
         else:
-            diff = read_change_diff(repo, change, environment)
+            diff = read_change_diff(repo, change, source, environment)
             if diff_is_binary(diff):
                 exclusion = "二進位檔案"
                 text = f"{heading}\n內容：未展開（{exclusion}）"
@@ -1393,13 +1493,32 @@ def write_private_message(message: str) -> Path:
     return path
 
 
-def commit_message(repo: Path, message: str) -> str:
+def commit_message(
+    repo: Path,
+    message: str,
+    *,
+    reword_source: DiffSource | None = None,
+) -> str:
     path = write_private_message(message)
     try:
-        result = run_git(repo, ["commit", "-F", str(path)], check=False)
+        arguments = ["commit"]
+        if reword_source is not None:
+            ensure_diff_source_unchanged(repo, reword_source)
+            arguments.extend(["--amend", "--only"])
+        arguments.extend(["-F", str(path)])
+        result = run_git(repo, arguments, check=False)
     finally:
         path.unlink(missing_ok=True)
     if result.returncode != 0:
+        if reword_source is not None:
+            if current_head_commit(repo, required=False) == reword_source.snapshot:
+                raise GitAcError(
+                    f"Git reword 階段失敗（exit code {result.returncode}）；原 HEAD 未改寫。"
+                )
+            raise GitAcError(
+                f"Git reword 階段失敗（exit code {result.returncode}），且 HEAD 狀態已改變；"
+                "請人工檢查 repository。"
+            )
         raise GitAcError(f"Git commit 階段失敗（exit code {result.returncode}）；staged 內容已保留。")
     return result.stdout.strip()
 
@@ -1407,7 +1526,7 @@ def commit_message(repo: Path, message: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="git ac",
-        description="由 Git 變更產生 Conventional Commits 訊息並建立單一 commit。",
+        description="由 Git 變更產生 Conventional Commits 訊息並建立或 reword 單一 commit。",
     )
     backend_group = parser.add_mutually_exclusive_group()
     backend_group.add_argument(
@@ -1443,6 +1562,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--message",
         action="append",
         help="提供一次 AI 產生 commit message 的參考資訊",
+    )
+    parser.add_argument(
+        "-r",
+        "--reword",
+        action="store_true",
+        help="依目前 HEAD diff 重新產生訊息並改寫該 commit；不納入目前 index",
     )
     parser.add_argument(
         "-p",
@@ -1486,6 +1611,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def retry_command(args: argparse.Namespace) -> str:
     flags: list[str] = []
+    if args.reword:
+        flags.append("--reword")
     if args.backend:
         flags.extend(["--backend", args.backend])
     if args.model:
@@ -1624,8 +1751,14 @@ def estimate_recommendation(
     plan: MessagePlan,
     backend: str,
     max_calls: int | None,
+    reword: bool = False,
 ) -> tuple[str, str]:
     if max_calls is not None and plan.minimum_calls > max_calls:
+        if reword:
+            return (
+                "超大型",
+                f"目前 HEAD diff 超過上限；只有確認成本後才提高 {backend} 呼叫上限。",
+            )
         return (
             "超大型",
             f"先拆分 staged 內容；只有確認成本後才提高 {backend} 呼叫上限。",
@@ -1650,6 +1783,8 @@ def report_estimate(
     selection: BackendSelection,
     guidance: PromptGuidance,
     emit: Callable[[str], None],
+    *,
+    reword: bool = False,
 ) -> None:
     included = [unit for unit in units if unit.exclusion_reason is None]
     excluded = [unit for unit in units if unit.exclusion_reason is not None]
@@ -1665,6 +1800,7 @@ def report_estimate(
         plan=plan,
         backend=selection.name,
         max_calls=max_calls,
+        reword=reword,
     )
 
     emit("git ac 估算結果：")
@@ -1696,27 +1832,38 @@ def execute_selected_snapshot(
     args: argparse.Namespace,
     repo: Path,
     environment: Mapping[str, str] | None,
+    source: DiffSource,
     selection: BackendSelection,
     guidance: PromptGuidance,
     raw_backend: Backend | None,
     *,
     simulated: bool,
 ) -> int:
-    changes = list_staged_changes(repo, environment)
-    units = build_diff_units(repo, changes, environment)
+    changes = list_changes(repo, source, environment)
+    units = build_diff_units(repo, changes, source, environment)
+    ensure_diff_source_unchanged(repo, source, environment)
     if args.estimate:
         if simulated:
             print("目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。")
+        if source.description:
+            print(source.description)
         report_change_selection(changes, units, print)
-        report_estimate(units, selection, guidance, print)
+        report_estimate(
+            units,
+            selection,
+            guidance,
+            print,
+            reword=source.kind == "head",
+        )
         return 0
 
     if raw_backend is None:
         raise GitAcError("內部 backend 尚未完成初始化。")
-    before = staged_snapshot(repo, environment)
     progress = lambda value: print(value, file=sys.stderr)
     if simulated:
         progress("目前沒有 staged 變更；以下以暫存 index 模擬 git add -A，真實 index 不會改變。")
+    if source.description:
+        progress(source.description)
     report_change_selection(changes, units, progress)
     max_calls = configured_backend_max_calls(selection.name)
     progress(f"backend：{selection.name}（{selection.backend_source}）")
@@ -1739,11 +1886,10 @@ def execute_selected_snapshot(
         try:
             message = validate_commit_message(generated.message, guidance.commit_type)
         except CommitMessageValidationError as initial_error:
-            after_initial = staged_snapshot(repo, environment)
-            if after_initial != before:
-                raise GitAcError(
-                    "模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。"
-                ) from initial_error
+            try:
+                ensure_diff_source_unchanged(repo, source, environment)
+            except GitAcError as snapshot_error:
+                raise snapshot_error from initial_error
             progress(
                 f"模型輸出格式無效（{initial_error}）；"
                 "正以相同 backend／model 自動修復一次。"
@@ -1762,6 +1908,7 @@ def execute_selected_snapshot(
                     f"首次模型輸出格式無效（{initial_error}）；"
                     f"自動修復未完成：{repair_error}"
                 ) from repair_error
+            ensure_diff_source_unchanged(repo, source, environment)
             try:
                 message = validate_commit_message(repaired, guidance.commit_type)
             except CommitMessageValidationError as repaired_error:
@@ -1771,14 +1918,16 @@ def execute_selected_snapshot(
                 ) from repaired_error
     finally:
         progress(f"模型呼叫次數：{backend.calls_used}")
-    after = staged_snapshot(repo, environment)
-    if after != before:
-        raise GitAcError("模型處理期間 staged snapshot 已改變；已中止，請檢查 index 後重試。")
+    ensure_diff_source_unchanged(repo, source, environment)
 
     if args.preview:
         print(message, end="")
         return 0
-    output = commit_message(repo, message)
+    output = commit_message(
+        repo,
+        message,
+        reword_source=source if args.reword else None,
+    )
     if output:
         print(output)
     return 0
@@ -1791,6 +1940,19 @@ def execute(args: argparse.Namespace) -> int:
     config = load_user_config()
     selection = resolve_backend_selection(args.backend, args.model, config)
     repo = find_repository()
+    if args.reword:
+        source = head_diff_source(repo)
+        raw_backend = None if args.estimate else build_backend(selection, repo, model_timeout())
+        return execute_selected_snapshot(
+            args,
+            repo,
+            None,
+            source,
+            selection,
+            guidance,
+            raw_backend,
+            simulated=False,
+        )
     staged = has_staged_changes(repo)
     worktree_changed = has_worktree_changes(repo) if not staged else True
     if not staged and not worktree_changed:
@@ -1798,10 +1960,12 @@ def execute(args: argparse.Namespace) -> int:
         return 0
     raw_backend = None if args.estimate else build_backend(selection, repo, model_timeout())
     if staged:
+        source = staged_diff_source(repo)
         return execute_selected_snapshot(
             args,
             repo,
             None,
+            source,
             selection,
             guidance,
             raw_backend,
@@ -1809,10 +1973,12 @@ def execute(args: argparse.Namespace) -> int:
         )
     if args.preview or args.estimate:
         with simulated_staged_environment(repo) as environment:
+            source = staged_diff_source(repo, environment)
             return execute_selected_snapshot(
                 args,
                 repo,
                 environment,
+                source,
                 selection,
                 guidance,
                 raw_backend,
@@ -1822,10 +1988,12 @@ def execute(args: argparse.Namespace) -> int:
     run_git(repo, ["add", "-A"])
     if not has_staged_changes(repo):
         raise GitAcError("自動 staging 後仍沒有可分析的 staged 變更。")
+    source = staged_diff_source(repo)
     return execute_selected_snapshot(
         args,
         repo,
         None,
+        source,
         selection,
         guidance,
         raw_backend,
