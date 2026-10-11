@@ -38,6 +38,11 @@ if log_path:
 mode = os.environ.get(f"GIT_AC_FAKE_{stage.upper()}_MODE", os.environ.get("GIT_AC_FAKE_MODE", "success"))
 if mode == "timeout":
     time.sleep(30)
+if mode == "timeout-once":
+    flag = Path(os.environ["GIT_AC_FAKE_TIMEOUT_FLAG"])
+    if not flag.exists():
+        flag.write_text("timed out\n")
+        time.sleep(30)
 if mode == "fail":
     raise SystemExit(17)
 if mode == "empty":

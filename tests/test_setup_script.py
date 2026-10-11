@@ -19,6 +19,8 @@ class SetupScriptTests(unittest.TestCase):
         self.environment = os.environ.copy()
         self.environment["HOME"] = str(self.home)
         self.environment["GIT_CONFIG_GLOBAL"] = str(self.home / ".gitconfig")
+        self.environment["PATH"] = str(ROOT / "tests" / "fakes" / "bin") + os.pathsep + os.environ.get("PATH", "")
+        self.environment["GIT_AC_BACKEND"] = "aichat"
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -69,6 +71,25 @@ class SetupScriptTests(unittest.TestCase):
         self.run_script("update")
 
         self.assertEqual(target.read_bytes(), (ROOT / "src" / "git_ac.py").read_bytes())
+
+    def test_unlicensed_afm_keeps_install_and_update_but_check_fails(self) -> None:
+        self.environment.update({"GIT_AC_BACKEND": "afm", "GIT_AC_FAKE_FM_MODE": "unlicensed"})
+        for action in ("install", "update"):
+            result = self.run_script(action)
+            self.assertIn("sudo fm license", result.stderr)
+            self.assertIn("已安裝／更新", result.stderr)
+            self.assertTrue((self.home / "bin" / "git-ac").exists())
+        checked = self.run_script("check", check=False)
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn("sudo fm license", checked.stderr)
+        self.assertFalse((self.home / "Library" / "Application Support" / "git-ac" / "config.toml").exists())
+
+    def test_setup_afm_check_does_not_generate(self) -> None:
+        log = self.home / "model-calls.jsonl"
+        self.environment.update({"GIT_AC_BACKEND": "afm", "GIT_AC_FAKE_LOG": str(log)})
+        self.run_script("install")
+        self.run_script("check")
+        self.assertFalse(log.exists())
 
     def test_install_does_not_overwrite_conflicting_alias(self) -> None:
         subprocess.run(

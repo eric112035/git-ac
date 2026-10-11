@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Offline fm preflight, token counter and generation contract."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+args = sys.argv[1:]
+mode = os.environ.get("GIT_AC_FAKE_FM_MODE", "success")
+if args == ["license", "--status"]:
+    if mode == "license-timeout":
+        time.sleep(30)
+    print("Not agreed" if mode == "unlicensed" else "Agreed to license FM1 version 1.0 on test date.")
+    raise SystemExit(0)
+if args == ["available", "--model", "system"]:
+    if mode == "available-timeout":
+        time.sleep(30)
+    reasons = {"disabled": "Apple Intelligence disabled", "download": "Model download not ready", "unsupported": "Device not eligible"}
+    print(reasons.get(mode, "System model available"))
+    raise SystemExit(1 if mode in reasons else 0)
+prompt = sys.stdin.read()
+tokens = len(prompt)  # Deliberately conservative for offline contract tests.
+if args == ["count-tokens", "--quiet"]:
+    if mode == "token-timeout":
+        time.sleep(30)
+    print("invalid" if mode == "bad-tokens" else tokens)
+    raise SystemExit(0)
+if args != ["respond", "--model", "system", "--no-stream", "--greedy"]:
+    raise SystemExit(2)
+if tokens > 3000:
+    raise SystemExit(9)
+stage = re.search(r"^TASK: (MAP|REDUCE|FINAL|REPAIR)$", prompt, re.M).group(1).lower()
+facts = sorted(set(re.findall(r"\bFACT_[A-Za-z0-9_]+\b", prompt)))
+if os.environ.get("GIT_AC_FAKE_LOG"):
+    with open(os.environ["GIT_AC_FAKE_LOG"], "a") as handle:
+        handle.write(json.dumps({"backend": "afm", "stage": stage, "args": args, "stdin_bytes": len(prompt.encode()), "tokens": tokens, "input_fact_markers": facts}) + "\n")
+if mode == "fail":
+    raise SystemExit(17)
+stage_mode = os.environ.get(f"GIT_AC_FAKE_{stage.upper()}_MODE", "success")
+if stage_mode == "timeout":
+    time.sleep(30)
+if os.environ.get("GIT_AC_FAKE_MUTATE_FILE") and stage == os.environ.get("GIT_AC_FAKE_MUTATE_STAGE", "final"):
+    path = Path(os.environ["GIT_AC_FAKE_MUTATE_FILE"])
+    path.write_text("模型執行期間變更\n")
+    subprocess.run(["git", "-C", os.environ["GIT_AC_FAKE_REPO"], "add", "--", str(path)], check=True)
+if mode == "empty":
+    raise SystemExit(0)
+if stage in {"map", "reduce"}:
+    print("摘要：保留變更事實 " + " ".join(facts))
+else:
+    print(os.environ.get(f"GIT_AC_FAKE_{stage.upper()}_OUTPUT", "feat: 新增變更處理\n\n保留事實：" + " ".join(facts)))

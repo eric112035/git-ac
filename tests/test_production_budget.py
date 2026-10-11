@@ -62,6 +62,8 @@ class ProductionBudgetTests(unittest.TestCase):
                 "GIT_AC_FAKE_LOG": str(self.fake_log),
                 "GIT_AC_FAKE_FINAL_FROM_FACTS": "1",
                 "GIT_AC_MODEL_TIMEOUT": "5",
+                "GIT_AC_BACKEND": "aichat",
+                "GIT_AC_AICHAT_PROMPT_BYTES": "24000",
                 "GIT_AC_TRACE_FILE": str(self.trace_log),
                 "GIT_AC_TRACE_CASE": self._testMethodName,
                 "PYTHONDONTWRITEBYTECODE": "1",
@@ -70,7 +72,7 @@ class ProductionBudgetTests(unittest.TestCase):
         if extra_env:
             env.update(extra_env)
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "-p"],
+            [sys.executable, str(SCRIPT), "-f", "-n", "256", "-T", "600", "-p"],
             cwd=self.repo,
             env=env,
             text=True,
@@ -88,7 +90,7 @@ class ProductionBudgetTests(unittest.TestCase):
         self.assertNotEqual(self.git("diff", "--cached", "--quiet", check=False).returncode, 0)
         self.assertNotEqual(self.git("rev-parse", "--verify", "HEAD", check=False).returncode, 0)
         trace = self.load_jsonl(self.trace_log)
-        self.assertTrue(all(int(event["prompt_bytes"]) <= 48_000 for event in trace))
+        self.assertTrue(all(int(event["prompt_bytes"]) <= 24_000 for event in trace))
         self.assertTrue(all(bool(event["success"]) for event in trace))
         self.assertTrue(
             all(

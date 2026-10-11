@@ -53,6 +53,8 @@ class GitAcIntegrationTests(unittest.TestCase):
         env = os.environ.copy()
         for name in (
             "GIT_AC_BACKEND",
+            "GIT_AC_AFM_MODEL",
+            "GIT_AC_AICHAT_PROMPT_BYTES",
             "GIT_AC_AICHAT_MODEL",
             "GIT_AC_CODEX_MODEL",
             "GIT_AC_CLAUDE_MODEL",
@@ -112,7 +114,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         calls = self.model_calls()
         self.assertEqual([(call["backend"], call["stage"]) for call in calls], [("aichat", "final")])
         self.assertEqual(calls[0]["args"], [])
-        self.assertIn("納入 AI 完整 diff 分析的檔案（1）", result.stderr)
+        self.assertIn("納入 AI 文字分析的檔案（1）", result.stderr)
         self.assertIn('A "app.txt"', result.stderr)
         self.assertIn(
             "model：omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit:git-ac（aichat default）",
@@ -699,8 +701,8 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("暫存 index 模擬 git add -A", result.stdout)
         self.assertIn('A "unstaged.txt"', result.stdout)
-        self.assertIn("分析檔案：1（完整分析 1，排除完整內容 0）", result.stdout)
-        self.assertIn("完整分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
+        self.assertIn("分析檔案：1（可分析文字 1，排除完整內容 0）", result.stdout)
+        self.assertIn("可分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
         self.assertEqual(self.git("status", "--short").stdout, "?? unstaged.txt\n")
         self.assertEqual(self.git("count-objects", "-v").stdout, objects_before)
         self.assertEqual(self.model_calls(), [])
@@ -720,8 +722,8 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('M "tracked.txt"', result.stdout)
         self.assertIn('A "untracked.txt"', result.stdout)
-        self.assertIn("分析檔案：2（完整分析 2，排除完整內容 0）", result.stdout)
-        self.assertIn("完整分析文字異動：+2 / -1 行（合計 3 行）", result.stdout)
+        self.assertIn("分析檔案：2（可分析文字 2，排除完整內容 0）", result.stdout)
+        self.assertIn("可分析文字異動：+2 / -1 行（合計 3 行）", result.stdout)
         self.assertEqual(self.git("write-tree").stdout.strip(), index_before)
         self.assertEqual(self.git("count-objects", "-v").stdout, objects_before)
         status = self.git("status", "--short").stdout
@@ -740,8 +742,8 @@ class GitAcIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("git ac 估算結果", result.stdout)
-        self.assertIn("分析檔案：2（完整分析 1，排除完整內容 1）", result.stdout)
-        self.assertIn("完整分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
+        self.assertIn("分析檔案：2（可分析文字 1，排除完整內容 1）", result.stdout)
+        self.assertIn("可分析文字異動：+1 / -0 行（合計 1 行）", result.stdout)
         self.assertIn("處理方式：直接 final", result.stdout)
         self.assertIn("預估模型呼叫：至少 1 次", result.stdout)
         self.assertIn("格式修復：首次驗證失敗時最多額外 1 次 repair", result.stdout)
@@ -762,6 +764,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         self.git("add", "-A")
 
         result = self.run_cli(
+            "-f",
             "--estimate",
             "-c",
             extra_env={"GIT_AC_CODEX_MAX_CALLS": "1"},
@@ -838,7 +841,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         result = self.run_cli("-p")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("納入 AI 完整 diff 分析的檔案（1）", result.stderr)
+        self.assertIn("納入 AI 文字分析的檔案（1）", result.stderr)
         self.assertIn('A "app.py"', result.stderr)
         self.assertIn("排除完整內容、只提供狀態與路徑的檔案（1）", result.stderr)
         self.assertIn('A "package-lock.json"（lockfile）', result.stderr)
@@ -1022,7 +1025,7 @@ class GitAcIntegrationTests(unittest.TestCase):
             (self.repo / f"large-{index}.txt").write_text(content, encoding="utf-8")
         self.git("add", "-A")
 
-        result = self.run_cli("-p", extra_env={"GIT_AC_FAKE_FINAL_FROM_FACTS": "1"})
+        result = self.run_cli("-f", "-n", "64", "-p", extra_env={"GIT_AC_FAKE_FINAL_FROM_FACTS": "1"})
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.model_calls()
@@ -1040,6 +1043,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         before = self.git("write-tree").stdout.strip()
 
         result = self.run_cli(
+            "-f",
             "-c",
             "-p",
             extra_env={"GIT_AC_CODEX_MAX_CALLS": "1"},
@@ -1084,6 +1088,7 @@ class GitAcIntegrationTests(unittest.TestCase):
         before = self.git("write-tree").stdout.strip()
 
         result = self.run_cli(
+            "-f",
             "--claude",
             "-p",
             extra_env={"GIT_AC_CLAUDE_MAX_CALLS": "1"},

@@ -121,20 +121,20 @@ class ByteChunkTests(unittest.TestCase):
         result = generate_message(
             units,
             backend,
-            budget=2_400,
+            budget=3_200,
             guidance=PromptGuidance(message="大型變更評測參考資訊"),
         )
         stages = [stage for stage, _prompt in backend.calls]
         self.assertIn("map", stages)
         self.assertIn("reduce", stages)
         self.assertEqual(stages[-1], "final")
-        self.assertTrue(all(utf8_size(prompt) <= 2_400 for _stage, prompt in backend.calls))
+        self.assertTrue(all(utf8_size(prompt) <= 3_200 for _stage, prompt in backend.calls))
         self.assertIn("FACT_ALPHA", result)
         self.assertIn("FACT_BETA", result)
 
     def test_final_payload_also_fits_reserved_repair_prompt(self) -> None:
         backend = RecordingBackend()
-        budget = 1_800
+        budget = 3_200
         generated = generate_message_result(
             [DiffUnit("large.txt", "FACT_ALPHA\n" + ("內容內容內容\n" * 800))],
             backend,
@@ -153,7 +153,7 @@ class ByteChunkTests(unittest.TestCase):
         backend = RecordingBackend()
         units = [DiffUnit("large.txt", "大型內容\n" * 2_000)]
         with self.assertRaisesRegex(GitAcError, "尚未送出任何模型 request"):
-            generate_message(units, backend, budget=1_800, max_calls=2)
+            generate_message(units, backend, budget=2_400, max_calls=2)
         self.assertEqual(backend.calls, [])
 
     def test_call_budget_backend_stops_before_exceeding_limit(self) -> None:
@@ -241,6 +241,7 @@ class PromptGuidanceTests(unittest.TestCase):
             PromptGuidance(commit_type=None, message="參考 issue #42"),
         )
         self.assertIn("feat：新增或擴充功能", prompt)
+        self.assertIn("設定值與預設值", prompt)
         self.assertIn("<USER_GUIDANCE>", prompt)
         self.assertIn("</USER_GUIDANCE>", prompt)
         self.assertIn("參考 issue #42", prompt)
@@ -358,7 +359,7 @@ class BackendConfigurationTests(unittest.TestCase):
 
     def test_cloud_call_limits_default_to_twelve_and_validate_override(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(configured_backend_max_calls("aichat"))
+            self.assertEqual(configured_backend_max_calls("aichat"), 12)
             self.assertEqual(configured_backend_max_calls("codex"), 12)
             self.assertEqual(configured_backend_max_calls("claude"), 12)
         for backend, variable in (

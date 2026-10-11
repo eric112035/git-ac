@@ -16,8 +16,8 @@ usage() {
 用法：./scripts/setup-git-ac.sh [install|update|check|help]
 
   install  安裝或重新安裝 ~/bin/git-ac，設定 ~/.zshrc 與全域 alias.ac（預設）
-  update   只以目前 src/git_ac.py 更新 ~/bin/git-ac
-  check    檢查執行檔、~/.zshrc、全域 alias.ac 與 help
+  update   以目前 src/git_ac.py 更新 ~/bin/git-ac，並檢查目前 backend
+  check    檢查執行檔、~/.zshrc、全域 alias.ac、help 與目前 backend
   help     顯示此說明
 EOF
 }
@@ -90,6 +90,16 @@ install_binary() {
   /usr/bin/install -m 755 "${SOURCE_FILE}" "${TARGET_FILE}"
 }
 
+check_backend() {
+  PATH="${BIN_DIR}:${PATH}" "${TARGET_FILE}" config check
+}
+
+guide_backend() {
+  if ! check_backend; then
+    print -u2 -r -- 'git-ac 已安裝／更新，但目前 backend 尚未就緒；請依上方提示完成設定，再執行 git ac config check。'
+  fi
+}
+
 install_all() {
   ensure_alias_is_safe
   ensure_path_config
@@ -100,12 +110,14 @@ install_all() {
   print -r -- "已設定：${ZSHRC_FILE}（${BIN_DIR} 加入 PATH）"
   print -r -- "已設定：git config --global alias.ac '${ALIAS_VALUE}'"
   print -r -- '請在目前終端執行 source ~/.zshrc（或 exec zsh），再以 git ac -h 驗證。'
+  guide_backend
 }
 
 update_binary() {
   [[ -e "${TARGET_FILE}" ]] || fail "尚未安裝 ${TARGET_FILE}；請先執行 install。"
   install_binary
   print -r -- "更新完成：${SOURCE_FILE} -> ${TARGET_FILE}"
+  guide_backend
 }
 
 check_installation() {
@@ -117,8 +129,9 @@ check_installation() {
   [[ "${existing_alias}" == "${ALIAS_VALUE}" ]] || fail "全域 alias.ac 未設定為 ${ALIAS_VALUE}。"
   "${TARGET_FILE}" -h >/dev/null
   PATH="${BIN_DIR}:${PATH}" git ac -h >/dev/null
+  check_backend || fail '目前 backend 尚未就緒；請依上方提示設定後重試。'
 
-  print -r -- "檢查完成：git-ac 執行檔、PATH 設定、Git alias 與 git ac -h 均有效。"
+  print -r -- "檢查完成：git-ac 執行檔、PATH 設定、Git alias、git ac -h 與目前 backend 均有效。"
   if [[ ":${PATH}:" != *":${BIN_DIR}:"* ]]; then
     print -u2 -r -- "目前 shell 尚未載入 ${BIN_DIR}；請執行 source ~/.zshrc（或 exec zsh）。"
   fi

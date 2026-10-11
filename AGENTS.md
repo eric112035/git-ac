@@ -5,8 +5,14 @@
 ## 長期目標與架構邊界
 
 - `git ac` 的長期目標是把使用者已決定的 staged snapshot 產生為一則繁體中文 Conventional Commits 訊息，並且只建立一個 commit；不得由 AI 自動改變 staging 邊界或拆分 commit。
-- aichat-first 是產品預設：`git ac` 預設走 `aitext` → `aichat`，實際 client、endpoint 與資料位置由使用者的 aichat 設定決定；使用者可明確選擇官方 Codex CLI 或 Claude Code CLI。任一 backend 失敗時不得自動切換。
-- 大型 diff 應透過檔案／hunk／行切塊與 recursive map-reduce 處理，不得重新加入總 diff bytes 的固定拒絕上限；所有路徑仍須維持單一 commit 與 staged snapshot 一致性。
+- 預設 backend 由固定品質評測決定：AFM 的六個 ground-truth 案例連續三次全部通過之前，保留 aichat 預設；AFM 可明確選用。既有使用者明確設定不得被升級覆寫。任一 backend 失敗時不得自動切換。
+- AFM 直接呼叫 macOS 27 官方 `fm` CLI，只支援本機 `system` model。自動 staging 前檢查授權與模型可用性；只引導使用者自行執行 `sudo fm license`，不得代為同意授權。
+- AFM 每個完整 prompt 以 `fm count-tokens --quiet` 檢查 3,000-token 輸入預算；aichat 預設 24,000 bytes（環境變數可調整為 8,000–48,000）；Codex／Claude 維持 48,000 bytes。Map／reduce 摘要以 1,000 UTF-8 bytes 為長度目標，不可直接截斷丟棄證據。
+- aichat／AFM 的 map／reduce 逾時只將該批拆小重試一次，子批次不得遞迴重試；final／repair 逾時直接中止。模型程序須以獨立 process group 啟動並在逾時或取消時清理整組子程序。
+- 預設快速模式：完整文字能同時容納 final／repair 時全部納入，超量才使用有來源座標的穩定代表片段；明示省略量，不保證完整 breaking change 涵蓋。最多 final＋一次 repair，不跑 map-reduce。
+- `-f／--full` 使用整理後的完整可分析文字執行 recursive map-reduce，不截斷證據。所有 backend 預設 12 次生成上限，`-n／--max-calls` 僅適用完整模式；超過已知最低呼叫預算須在生成前中止，不得重新加入總 diff bytes 的固定拒絕上限。
+- `-T／--max-time` 限制整段分析（含 preflight、整理及 token 計數），快速／完整預設 120／300 秒。每次外部程序受單次 timeout 與剩餘期限共同限制；期限到期清理程序且不重試。Git commit／hook 不計入 AI 期限。
+- 僅減量可驗證解碼的大型單行媒體 Base64 data URI，保留新增／刪除／未變更狀態、MIME、大小與 SHA-256；建置產物只依分析版本的 `linguist-generated=set/true` 標記，不依 dist／build 路徑推測。維持 unified=3。
 - `src/aitext` 是本專案自製 wrapper 的唯一來源，只負責避免 REPL、轉交 `aichat` 參數與 stdin、去除 `<think>` 區段、保留 `aichat` exit code 及正規化結尾換行；它是內部 wrapper，不是公開 backend。模型 client、endpoint 與 profile 由使用者在 aichat 設定中管理，git-ac 不修改 aichat YAML。
 - Codex 與 Claude backend 直接使用各自官方 CLI，不經 `aichat`、`aitext` 或 `CLIProxyAPI`。backend、可選 model、設定 schema、預設模型、prompt budget 或模型呼叫上限是版本化的整體決策，變更時必須同步更新評測、測試與 README，不能依單一 diff 靜默切換。
 
@@ -31,6 +37,7 @@
 - 不得使用此 repository 本身的 index、working tree 或 commit 歷史測試 `git ac`；手動驗證必須在 `.test-workspace/` 下另建 Git repository。
 - 一般驗證優先使用 `tests/fakes/bin` 的 fake `aitext`、`aichat`、`codex` 與 `claude`，不得連線或消耗模型額度。真實 aichat client、Codex 或 Claude 驗收只有在使用者明確要求時才執行，輸出仍須放在 `.test-workspace/`。
 - fake backend 測試只能證明 orchestration 與安全邊界；發行 aichat backend 前仍需完成真實 `aitext`／aichat 驗收。發行或變更 Codex、Claude 預設 model 前，必須用固定 ground truth 評測集驗證繁體中文、Conventional Commits、map/reduce 必要事實、breaking change 與虛構內容門檻。
+- 快速／完整模式驗收明確選擇 backend，使用 `tests/run_real_backend_eval.py --backend BACKEND --suite modes --repeats 3`：六個固定案例快速模式各三次、大型案例完整模式三次、合成旅遊網站快速模式三次。快速模式不要求 map，但必要事實、breaking change 與虛構內容門檻不得降低；報告按模式記錄預算、納入／省略量、呼叫及耗時。
 - 修改指令後至少執行受影響測試；若改到共用流程，執行完整離線測試：
 
   ```sh

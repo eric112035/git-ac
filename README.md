@@ -8,13 +8,15 @@
 
 ## 功能摘要
 
-- 支援 `aichat`、官方 Codex CLI 與 Claude Code CLI 三種 backend。
+- 支援 Apple Foundation Models（`afm`）、`aichat`、官方 Codex CLI 與 Claude Code CLI 四種 backend。
 - 預設使用 `aichat`；backend 失敗時中止，不會自動切換服務。
-- 尊重既有 staged 邊界；大型 diff 會自動分塊並以 recursive map-reduce 處理。
+- 生成提示要求保留使用者明確指定且有證據支持的名稱／編號；標題放不下時寫入 body。格式驗證通過不代表語意一定正確，可先用 `-p` 檢視。
+- 尊重既有 staged 邊界；預設快速模式最多 final＋一次 repair，超量時明示代表片段與省略量。`-f` 可啟用有預算限制的完整 map-reduce。
 - 可先 preview commit message，或只估算規模與最低模型呼叫數。
 - 可從目前 `HEAD` 的 diff 重新產生並替換 commit message，不納入新的 staged／working tree 內容。
 - 驗證 Conventional Commits 格式、繁體中文內容與 staged snapshot 一致性後才 commit。
 - 首次格式驗證失敗時，會由相同 backend／model 依原始證據自動重產一次；仍不合格就安全中止。
+- aichat／AFM 的 map、reduce 批次逾時時，只拆小失敗批次重試一次；最後仍只建立一個 commit。
 
 ## 前置條件
 
@@ -25,6 +27,7 @@
 
 |Backend|前置需求|未設定 model 時|
 |---|---|---|
+|`afm`|macOS 27 內建 `fm`、已同意授權、可用的 Apple Intelligence 模型|只支援本機 `system`|
 |`aichat`|已設定的 `aichat` 與本專案的 `aitext` wrapper|沿用 aichat 預設 model|
 |`codex`|已安裝並登入的官方 Codex CLI|`gpt-5.6-luna`|
 |`claude`|已安裝並登入的 Claude Code CLI|`haiku` alias|
@@ -41,7 +44,6 @@ git config --global user.email "you@example.com"
 ```sh
 ./scripts/setup-git-ac.sh install
 source ~/.zshrc
-./scripts/setup-git-ac.sh check
 git ac -h
 ```
 
@@ -53,7 +55,32 @@ git config --global alias.ac '!git-ac'
 
 若已存在內容不同的全域 `alias.ac`，安裝會中止而不覆寫。完整行為請見 [安裝與更新](https://github.com/eric112035/git-ac/wiki/Installation-and-Update)。
 
+安裝與更新後會檢查目前 backend；未就緒時保留安裝成果並顯示設定引導。完成下方 backend 設定後，再執行 `./scripts/setup-git-ac.sh check`；此指令會在 backend 未就緒時回傳失敗。
+
 ## 準備 backend
+
+### Apple Foundation Models（AFM）
+
+使用 [macOS 27 內建的官方 `fm` CLI](https://developer.apple.com/videos/play/wwdc2026/334/)，需要支援 Apple Intelligence 的 Mac，且模型已啟用並下載完成；不涵蓋所有 Mac。
+
+```sh
+fm license --status
+```
+
+若尚未同意授權，自行執行 `sudo fm license` 閱讀並同意條款。git-ac 只檢查與提示，不代為同意或執行 sudo。
+
+```sh
+git ac --backend afm config check
+git ac --backend afm -p
+# 確認品質適合後，明確選用：
+git ac config set backend afm
+```
+
+資料只交給本機 `system` 模型，不需要 API key 或常駐 server。每批完整 prompt 以 `fm count-tokens --quiet` 確認不超過 3,000 tokens。`config check` 不產生模型回應；正式生成仍可能因系統服務或模型品質而失敗。
+
+目前 AFM 尚未通過全部固定品質驗收，因此供明確選用，內建預設保留 aichat。只有六個案例各連續三次全部通過，才會在後續版本切換內建預設；更新不覆寫使用者既有設定。
+
+2026-09-26 在 macOS 27 的 AFM 舊版評測為 3／18 次通過，其中小型案例將未複製 `FACT_` 字串算作事實遺漏，因此不能視為模型正確率。已確認的其他問題包括 breaking change 漏標、type 錯誤，以及約 180 KiB 大型案例三次均於約 10 分 49 秒後因 reduce 重試仍逾時而中止。新版評測改查小型案例的必要內容證據，AFM 尚未以新規則重跑。重現方式與門檻見 [架構與開發](https://github.com/eric112035/git-ac/wiki/Architecture-and-Development#afm-預設切換驗收)。
 
 ### aichat
 
@@ -71,6 +98,8 @@ git ac config check
 ```
 
 資料送往本機或雲端取決於 aichat 的 client／endpoint；使用 `aichat` backend 不代表資料一定留在本機。
+
+2026-09-26～27，以 `omlx:mlx-community/gemma-4-26B-A4B-it-qat-4bit` 執行同組固定案例，未重現 AFM 的 breaking change 漏標或文件 type 錯誤。大型案例曾漏掉明確指定的編號；補強 final／repair 提示後三次均保留完整資訊且未逾時。這是固定案例的驗收結果，不代表所有變更都不會誤判；評測方式與限制見 [架構與開發](https://github.com/eric112035/git-ac/wiki/Architecture-and-Development#aichat-同組對照)。
 
 ### Codex
 
@@ -96,7 +125,7 @@ git ac config set backend claude
 git ac config check
 ```
 
-三種 backend 的資料流、model 覆寫與隔離方式請見 [Backend](https://github.com/eric112035/git-ac/wiki/Backends)。
+四種 backend 的資料流、model 覆寫與隔離方式請見 [Backend](https://github.com/eric112035/git-ac/wiki/Backends)。
 
 ## 第一次使用
 
@@ -107,6 +136,8 @@ git ac config show
 git ac -e
 git ac -p
 git ac
+git ac -f -e
+git ac -f -n 24 -T 600
 ```
 
 - `git ac -e`：估算規模、最低模型呼叫數與條件式 repair，不呼叫模型。
@@ -118,6 +149,7 @@ git ac
 ```sh
 git ac -c -p
 git ac --claude -p
+git ac --backend afm -p
 git ac --backend aichat -p
 git ac -p -t fix
 git ac -p -m "修正登入逾時，對應 issue #123"
@@ -150,6 +182,34 @@ git ac -r -t fix -m "補充原 commit 的設計理由"
 - Reword 會建立新的 commit object 並改變 hash；若舊 commit 已推送，後續同步可能需要協調並改寫遠端歷史。git-ac 不會自動 push。
 
 詳細流程與限制請見 [Staging 與安全邊界](https://github.com/eric112035/git-ac/wiki/Staging-and-Safety)。
+
+## 大型變更與逾時
+
+`git ac` 預設快速模式，不需額外參數。整理後內容能同時放入 final 與預留 repair 時全部納入；超量時 metadata 最多占可用容量四分之一且不超過 4 KiB，其餘依路徑穩定排序輪流選取各檔案首尾片段，每片最多 2 KiB。會揭露未列路徑與省略量；快速模式不保證涵蓋所有 breaking change，可用 `-p` 審視。
+
+兩種模式保留 3 行 diff context，將超過 1 KiB、可驗證解碼的單行媒體 Base64 data URI 改成 MIME、解碼大小及 SHA-256 描述，保留新增／刪除／未變更標記。只有分析版本 `.gitattributes` 的 `linguist-generated` 為 set／true 才只提供路徑與狀態；未標記的 dist／build 手寫檔案仍分析。一般／preview 使用對應 index 屬性，reword 使用被分析 commit 屬性。
+
+|模式／參數|行為|
+|---|---|
+|快速（預設）|最多 2 次生成：final＋必要時 repair；總時間 120 秒|
+|`-f`／`--full`|完整可分析文字經 map-reduce，預設最多 12 次生成；總時間 300 秒|
+|`-n`／`--max-calls`|完整模式正整數上限；CLI 優先於既有 Codex／Claude 上限環境變數，再採預設 12|
+|`-T`／`--max-time`|兩種模式的總秒數正整數上限|
+
+完整模式最低呼叫數（map 批次＋final）超標時，生成前中止並顯示提高預算的指令；最低值不含未知 reduce、重試與 repair。所有生成嘗試均計入上限，每輪開始前檢查已知剩餘工作，每次生成前再硬性檢查。快速模式也尊重既有更嚴格的 backend 上限。不會自動切換模式或 backend，也不提交部分結果。
+
+aichat 每批完整 prompt 預設 24,000 UTF-8 bytes，可用 `GIT_AC_AICHAT_PROMPT_BYTES` 在 8,000–48,000 間調整；Codex／Claude 維持 48,000 bytes。AFM 使用 3,000-token 保守輸入預算，並非模型實際 context 上限。
+
+```sh
+GIT_AC_AICHAT_PROMPT_BYTES=12000 git ac --backend aichat -p
+GIT_AC_MODEL_TIMEOUT=240 git ac --backend aichat -T 300 -p
+```
+
+`GIT_AC_MODEL_TIMEOUT` 預設單次 120 秒；外部程序使用既有單次 timeout 與剩餘總時間的較小值。總期限從 backend preflight 前開始，含整理、token 計數與生成，Git commit／hook 不計入。期限到期清理整組程序且不啟動拆批或 repair。完整模式的 aichat／AFM 摘要單次逾時可只拆失敗批次重試一次；final／repair 單次逾時直接中止。進度顯示原始／整理後／納入大小、各檔案原因、呼叫與耗時；preview stdout 只含訊息，診斷寫 stderr。Trace 僅記錄統計，不保存 diff、prompt 或資產本文。
+
+`-e` 不需要可用的 `fm`，AFM 的批次數是保守估算；實際 token 檢查、reduce、拆批重試或格式 repair 都可能使呼叫數不同。
+
+2026-10-11，以目前 Gemma 完成新模式 24／24 次合成驗收：快速模式 21 次各只呼叫一次，完整大型案例三次各呼叫 10 次。詳細案例、耗時與限制見 [模式驗收](https://github.com/eric112035/git-ac/wiki/Architecture-and-Development#快速完整模式驗收2026-10-11)。
 
 ## 更新
 
